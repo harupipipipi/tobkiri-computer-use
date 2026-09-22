@@ -34,6 +34,9 @@ The macOS package, scripts, tests, patches, and skill live under `mac/`.
 Run `cd mac` and then `.venv/bin/python -m pytest`. For actual GUI checks, use only the dedicated
 TobkiriFixture windows and the opt-in `scripts/live_acceptance.py`. Ordinary tests
 must not interact with the user's desktop. Do not edit PR #1322's checkouts.
+The Windows port lives under `windows/`. Run `cd windows` and
+`.venv\Scripts\python.exe -m pytest`; GUI checks may use only the disposable
+`WindowsComputerFixture` through the two opt-in Windows acceptance scripts.
 Keep generated artifacts, screenshots, raw logs, local benchmark configurations,
 and local compatibility symlinks out of Git. The published benchmark templates
 are path-normalized; preserve the original local prompts and historical hashes.
