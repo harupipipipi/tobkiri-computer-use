@@ -1,0 +1,100 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; color: #172033; font: 13px -apple-system, sans-serif; }
+  #scroll { height: 100%; overflow: auto; }
+  #region { min-height: 820px; box-sizing: border-box; padding: 16px; border: 1px solid #c8ced9; }
+  #status { position: sticky; top: 0; padding: 8px; background: #edf3ff; border: 1px solid #b6c9ee; white-space: pre-wrap; }
+  .hint { color: #526078; margin-top: 18px; }
+  .bottom { margin-top: 730px; color: #526078; }
+</style>
+</head>
+<body>
+<div id="scroll">
+  <div id="region">
+    <div id="status">WKWebView local DOM event region</div>
+    <p class="hint">Scrollable empty local HTML. Wheel listeners are passive and do not cancel default scrolling.</p>
+    <p class="hint">Right-click records mouse callbacks and contextmenu. No external content is loaded.</p>
+    <p class="bottom">Scroll position is shown above.</p>
+  </div>
+</div>
+<script>
+(() => {
+  const scroll = document.getElementById("scroll");
+  const region = document.getElementById("region");
+  const status = document.getElementById("status");
+  const counts = {
+    left_down: 0, left_up: 0, right_down: 0, right_up: 0, contextmenu: 0,
+    middle_down: 0, middle_up: 0, middle_click: 0, wheel: 0,
+    wheel_delta_x: 0, wheel_delta_y: 0
+  };
+  const names = {0: "left", 1: "middle", 2: "right"};
+  let paintQueued = false;
+
+  function render() {
+    paintQueued = false;
+    status.textContent =
+      "WK callbacks\nL " + counts.left_down + "/" + counts.left_up +
+      "  R " + counts.right_down + "/" + counts.right_up +
+      "  menu " + counts.contextmenu +
+      "  M " + counts.middle_down + "/" + counts.middle_up +
+      "  wheel " + counts.wheel + " Δ " + counts.wheel_delta_y +
+      "  scroll " + scroll.scrollTop;
+  }
+  function scheduleRender() {
+    if (!paintQueued) {
+      paintQueued = true;
+      requestAnimationFrame(render);
+    }
+  }
+  function publish(event, domType, button, deltaX, deltaY) {
+    const payload = {
+      event: event, dom_type: domType, button: button,
+      delta_x: deltaX || 0, delta_y: deltaY || 0,
+      counts: Object.assign({}, counts), scroll_top: scroll.scrollTop
+    };
+    const bridge = window.webkit && window.webkit.messageHandlers &&
+      window.webkit.messageHandlers.pointerProbe;
+    if (bridge && typeof bridge.postMessage === "function") {
+      try { bridge.postMessage(payload); } catch (_) {}
+    }
+    scheduleRender();
+  }
+  function mouse(kind, event) {
+    const button = names[event.button];
+    if (!button) return;
+    counts[button + "_" + kind] += 1;
+    publish(button + "_" + kind, event.type, event.button, 0, 0);
+  }
+
+  region.addEventListener("mousedown", event => mouse("down", event));
+  region.addEventListener("mouseup", event => mouse("up", event));
+  region.addEventListener("auxclick", event => {
+    if (event.button === 1) {
+      counts.middle_click += 1;
+      publish("middle_click", event.type, event.button, 0, 0);
+    }
+  });
+  region.addEventListener("contextmenu", event => {
+    counts.contextmenu += 1;
+    publish("contextmenu", event.type, event.button, 0, 0);
+  });
+  region.addEventListener("wheel", event => {
+    counts.wheel += 1;
+    counts.wheel_delta_x += event.deltaX;
+    counts.wheel_delta_y += event.deltaY;
+    publish("wheel", event.type, -1, event.deltaX, event.deltaY);
+  }, {passive: true});
+  scroll.addEventListener("scroll", () => publish("scroll", "scroll", -1, 0, 0), {passive: true});
+  window.pointerProbeReset = () => {
+    Object.keys(counts).forEach(key => counts[key] = 0);
+    publish("reset", "reset", -1, 0, 0);
+  };
+  publish("ready", "ready", -1, 0, 0);
+})();
+</script>
+</body>
+</html>

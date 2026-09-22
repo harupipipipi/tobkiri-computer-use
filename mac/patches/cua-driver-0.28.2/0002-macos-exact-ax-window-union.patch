@@ -1,0 +1,227 @@
+From: Tobkiri exact-window audit
+Base: cua-driver-rs-v0.28.2 (fc188250b4ca8549b8e61f937fdb1fb560770e86)
+Subject: [PATCH 2/3] fix(cua-driver): align exact-target AX window sources
+
+The observation walker accepts exact `_AXUIElementGetWindow` matches from the
+application's AXChildren/AXWindows union, while the mutation gate samples only
+AXWindows. Use the same source union in the gate. Identity still requires the
+requested pid's live CGWindowID from WindowServer and an exact SPI-reported id;
+there is no title, geometry, focus, or foreground fallback.
+
+When distinct AX proxies for the same exact id disagree on minimized state, the
+conflict remains explicit for the whole sample. A later duplicate cannot turn
+that real conflict into an apparently known state.
+
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
+index c07f19b..bd77bc9 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
+@@ -2,7 +2,7 @@
+ //!
+ //! Gathers the facts [`cua_driver_core::background_input`] needs about one
+ //! requested `(pid, CGWindowID)` immediately before a background mutation:
+-//! WindowServer ownership, fresh `AXWindows` membership (mapped through
++//! WindowServer ownership, fresh top-level AX window membership (mapped through
+ //! `_AXUIElementGetWindow`), minimized/hidden state, competing same-pid AX
+ //! top-level keyboard destinations, and addressed-element ancestry. All reads are
+ //! bounded and fail closed — an unreadable fact never unlocks a route.
+@@ -13,8 +13,8 @@ use cua_driver_core::background_input::{
+ };
+ 
+ use super::bindings::{
+-    ax_get_window_id, copy_ax_windows, copy_bool_attr, copy_element_attr, copy_string_attr,
+-    focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
++    ax_get_window_id, copy_ax_windows, copy_bool_attr, copy_children, copy_element_attr,
++    copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
+ };
+ use crate::windows::{all_windows, resolve_window_owner, WindowOwner};
+ 
+@@ -89,29 +89,83 @@ pub unsafe fn focused_element_in_window(pid: i32, window_id: u32) -> Option<AXUI
+     }
+ }
+ 
+-/// One fresh `AXWindows` row: the mapped CGWindowID plus its minimized state.
++/// One fresh top-level AX window row: the mapped CGWindowID plus its minimized state.
+ /// `minimized: None` means the attribute could not be read — unknown, not
+ /// "not minimized".
+ struct AxWindowRecord {
+     window_id: u32,
+     minimized: Option<bool>,
++    // Keep a real disagreement distinct from a simple unreadable duplicate so
++    // later proxies cannot make the record look known again.
++    minimized_conflict: bool,
+ }
+ 
+-/// Map the application's fresh `AXWindows` through `_AXUIElementGetWindow`.
+-/// Windows whose id the SPI cannot resolve are omitted: an unmappable window
+-/// can never satisfy an exact-target requirement.
+-unsafe fn ax_window_records(app: AXUIElementRef) -> Vec<AxWindowRecord> {
+-    copy_ax_windows(app)
+-        .into_iter()
+-        .filter_map(|window| {
+-            let record = ax_get_window_id(window).map(|window_id| AxWindowRecord {
++fn merge_ax_window_record(records: &mut Vec<AxWindowRecord>, incoming: AxWindowRecord) {
++    if let Some(existing) = records
++        .iter_mut()
++        .find(|record| record.window_id == incoming.window_id)
++    {
++        // Two AX proxies for one CGWindowID can disagree transiently. Preserve
++        // a known value over an unreadable one, but fail closed on a real
++        // conflict so pointer/keyboard routes cannot be unlocked by ordering.
++        if existing.minimized_conflict || incoming.minimized_conflict {
++            existing.minimized = None;
++            existing.minimized_conflict = true;
++            return;
++        }
++        match (existing.minimized, incoming.minimized) {
++            (Some(left), Some(right)) if left != right => {
++                existing.minimized = None;
++                existing.minimized_conflict = true;
++            }
++            (known @ Some(_), None) | (None, known @ Some(_)) => {
++                existing.minimized = known;
++            }
++            _ => {}
++        }
++    } else {
++        records.push(incoming);
++    }
++}
++
++/// Map retained AX elements through `_AXUIElementGetWindow`, then release them.
++/// `AXChildren` also contains menu bars and sheets, so only its `AXWindow`
++/// rows are eligible. `AXWindows` is already window-typed by contract.
++unsafe fn extend_ax_window_records(
++    records: &mut Vec<AxWindowRecord>,
++    elements: Vec<AXUIElementRef>,
++    require_window_role: bool,
++) {
++    for window in elements {
++        let eligible = !require_window_role
++            || copy_string_attr(window, "AXRole").as_deref() == Some("AXWindow");
++        let record = eligible.then(|| {
++            ax_get_window_id(window).map(|window_id| AxWindowRecord {
+                 window_id,
+                 minimized: copy_bool_attr(window, "AXMinimized"),
+-            });
+-            CFRelease(window as CFTypeRef);
+-            record
+-        })
+-        .collect()
++                minimized_conflict: false,
++            })
++        });
++        CFRelease(window as CFTypeRef);
++        if let Some(Some(record)) = record {
++            merge_ax_window_record(records, record);
++        }
++    }
++}
++
++/// Map the same fresh top-level union used by the AX tree walker.
++///
++/// AppKit can expose a live top-level window through `AXChildren` while a
++/// concurrent `AXWindows` read is empty (and vice versa). The observation path
++/// already unions both attributes. Applying the same exact SPI mapping here
++/// prevents an observed `(pid, CGWindowID)` from being rejected solely because
++/// the mutation gate sampled the narrower attribute. Windows whose id the SPI
++/// cannot resolve remain omitted and can never satisfy an exact-target check.
++unsafe fn ax_window_records(app: AXUIElementRef) -> Vec<AxWindowRecord> {
++    let mut records = Vec::new();
++    extend_ax_window_records(&mut records, copy_children(app), true);
++    extend_ax_window_records(&mut records, copy_ax_windows(app), false);
++    records
+ }
+ 
+ /// Count independently AX-mapped, non-minimized sibling top-level windows.
+@@ -119,7 +173,7 @@ unsafe fn ax_window_records(app: AXUIElementRef) -> Vec<AxWindowRecord> {
+ /// WindowServer may expose several layer-0 compositor surfaces for one native
+ /// Electron, Tauri, or WebKit window. A raw same-pid CGWindow row is therefore
+ /// not enough to prove another process-scoped keyboard destination. Requiring a
+-/// fresh `AXWindows` mapping preserves the fail-closed two-window guard while
++/// fresh top-level AX mapping preserves the fail-closed two-window guard while
+ /// ignoring render surfaces that cannot independently become the AX key window.
+ fn count_competing_keyboard_destinations(
+     pid: i32,
+@@ -207,12 +261,13 @@ pub fn gather_background_facts(
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{count_competing_keyboard_destinations, AxWindowRecord};
++    use super::{count_competing_keyboard_destinations, merge_ax_window_record, AxWindowRecord};
+ 
+     fn ax_window(window_id: u32, minimized: Option<bool>) -> AxWindowRecord {
+         AxWindowRecord {
+             window_id,
+             minimized,
++            minimized_conflict: false,
+         }
+     }
+ 
+@@ -259,4 +314,66 @@ mod tests {
+             0
+         );
+     }
++
++    #[test]
++    fn top_level_sources_are_unioned_by_exact_window_id() {
++        let mut records = vec![ax_window(10, Some(false))];
++        merge_ax_window_record(&mut records, ax_window(20, Some(false)));
++
++        assert_eq!(records.len(), 2);
++        assert!(records.iter().any(|record| record.window_id == 10));
++        assert!(records.iter().any(|record| record.window_id == 20));
++    }
++
++    #[test]
++    fn duplicate_exact_window_id_does_not_create_keyboard_ambiguity() {
++        let mut records = vec![ax_window(10, Some(false))];
++        merge_ax_window_record(&mut records, ax_window(10, Some(false)));
++
++        assert_eq!(records.len(), 1);
++        assert_eq!(records[0].minimized, Some(false));
++        assert!(!records[0].minimized_conflict);
++    }
++
++    #[test]
++    fn conflicting_proxy_visibility_fails_closed() {
++        let mut records = vec![ax_window(10, Some(false))];
++        merge_ax_window_record(&mut records, ax_window(10, Some(true)));
++
++        assert_eq!(records[0].minimized, None);
++        assert!(records[0].minimized_conflict);
++    }
++
++    #[test]
++    fn unreadable_duplicate_preserves_known_visibility_regardless_of_order() {
++        for minimized in [[Some(false), None], [None, Some(false)]] {
++            let mut records = vec![ax_window(10, minimized[0])];
++            merge_ax_window_record(&mut records, ax_window(10, minimized[1]));
++
++            assert_eq!(records[0].minimized, Some(false));
++            assert!(!records[0].minimized_conflict);
++        }
++    }
++
++    #[test]
++    fn conflicting_visibility_is_sticky_across_triple_duplicate_permutations() {
++        for minimized in [
++            [Some(false), Some(true), None],
++            [Some(false), None, Some(true)],
++            [Some(true), Some(false), None],
++            [Some(true), None, Some(false)],
++            [None, Some(false), Some(true)],
++            [None, Some(true), Some(false)],
++            [Some(false), Some(true), Some(false)],
++            [Some(true), Some(false), Some(true)],
++        ] {
++            let mut records = vec![ax_window(10, minimized[0])];
++            merge_ax_window_record(&mut records, ax_window(10, minimized[1]));
++            merge_ax_window_record(&mut records, ax_window(10, minimized[2]));
++
++            assert_eq!(records.len(), 1);
++            assert_eq!(records[0].minimized, None);
++            assert!(records[0].minimized_conflict);
++        }
++    }
+ }

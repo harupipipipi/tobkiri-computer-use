@@ -1,0 +1,90 @@
+--- a/libs/cua-driver/rust/crates/platform-macos/src/input/mouse.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/input/mouse.rs
+@@ -692,6 +692,16 @@
+     if flags != CGEventFlags::CGEventFlagNull {
+         down.set_flags(flags);
+     }
++
++    // Construct the matching release before posting mouseDown. Event creation
++    // is the only fallible operation after a press begins; keeping a ready
++    // mouseUp means every later error can still terminate pointer capture.
++    let to_pt = CGPoint::new(to_x, to_y);
++    let up = CGEvent::new_mouse_event(source.clone(), up_type, to_pt, cg_button)
++        .map_err(|_| anyhow::anyhow!("drag mouseUp failed before mouseDown"))?;
++    if flags != CGEventFlags::CGEventFlagNull {
++        up.set_flags(flags);
++    }
+     post_mouse_event(
+         pid,
+         &down,
+@@ -705,37 +715,36 @@
+     observe(from_x, from_y);
+     std::thread::sleep(std::time::Duration::from_millis(16));
+ 
+-    // Interpolated drag steps.
+-    for i in 1..=steps {
+-        let t = i as f64 / steps as f64;
+-        let ix = from_x + (to_x - from_x) * t;
+-        let iy = from_y + (to_y - from_y) * t;
+-        let il = from_local
+-            .zip(to_local)
+-            .map(|((fx, fy), (tx, ty))| (fx + (tx - fx) * t, fy + (ty - fy) * t));
+-        let drag_pt = CGPoint::new(ix, iy);
+-        let drag = CGEvent::new_mouse_event(source.clone(), dragged_type, drag_pt, cg_button)
+-            .map_err(|_| anyhow::anyhow!("drag mouseDragged failed"))?;
+-        if flags != CGEventFlags::CGEventFlagNull {
+-            drag.set_flags(flags);
+-        }
+-        post_mouse_event(pid, &drag, il, wid, click_group_id, 1, button_number, 0);
+-        observe(ix, iy);
+-        if step_delay_ms > 0 {
+-            std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
++    // Interpolated drag steps. Do not return directly from this block: once
++    // mouseDown has been posted the prebuilt mouseUp below must run even when
++    // construction of an intermediate event fails.
++    let path_result = (|| -> anyhow::Result<()> {
++        for i in 1..=steps {
++            let t = i as f64 / steps as f64;
++            let ix = from_x + (to_x - from_x) * t;
++            let iy = from_y + (to_y - from_y) * t;
++            let il = from_local
++                .zip(to_local)
++                .map(|((fx, fy), (tx, ty))| (fx + (tx - fx) * t, fy + (ty - fy) * t));
++            let drag_pt = CGPoint::new(ix, iy);
++            let drag = CGEvent::new_mouse_event(source.clone(), dragged_type, drag_pt, cg_button)
++                .map_err(|_| anyhow::anyhow!("drag mouseDragged failed"))?;
++            if flags != CGEventFlags::CGEventFlagNull {
++                drag.set_flags(flags);
++            }
++            post_mouse_event(pid, &drag, il, wid, click_group_id, 1, button_number, 0);
++            observe(ix, iy);
++            if step_delay_ms > 0 {
++                std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
++            }
+         }
+-    }
++        Ok(())
++    })();
+ 
+     // MouseUp at end.
+     // Give Chromium one run-loop turn to process the final dragged event at
+     // the drop point before releasing pointer capture.
+     std::thread::sleep(std::time::Duration::from_millis(50));
+-    let to_pt = CGPoint::new(to_x, to_y);
+-    let up = CGEvent::new_mouse_event(source.clone(), up_type, to_pt, cg_button)
+-        .map_err(|_| anyhow::anyhow!("drag mouseUp failed"))?;
+-    if flags != CGEventFlags::CGEventFlagNull {
+-        up.set_flags(flags);
+-    }
+     post_mouse_event(pid, &up, to_local, wid, click_group_id, 1, button_number, 0);
+     if foreground_release {
+         // A frontmost Chromium surface can consume PID-routed down/move
+@@ -749,7 +758,7 @@
+     // complete pointer capture before that restore.
+     std::thread::sleep(std::time::Duration::from_millis(100));
+ 
+-    Ok(())
++    path_result
+ }
+ 
+ /// Foreground drag through the global HID event tap.

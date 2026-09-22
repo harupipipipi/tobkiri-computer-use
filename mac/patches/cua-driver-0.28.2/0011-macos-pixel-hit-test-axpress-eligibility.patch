@@ -1,0 +1,75 @@
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
+index c909f11..f4fd05a 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
+@@ -25,7 +25,7 @@ use std::sync::Arc;
+ 
+ use crate::apps;
+ use crate::ax::bindings::{
+-    copy_action_names, copy_children, copy_string_attr, element_at_screen_position,
++    copy_action_names, copy_bool_attr, copy_children, copy_string_attr, element_at_screen_position,
+     element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction, AXUIElementRef,
+ };
+ use crate::focus_guard;
+@@ -98,6 +98,10 @@ fn pixel_activation_policy(
+     }
+ }
+ 
++fn hit_test_ax_press_eligible(advertised: &[String], enabled: Option<bool>) -> bool {
++    enabled != Some(false) && advertised.iter().any(|action| action == "AXPress")
++}
++
+ /// Return the prior foreground pid that should be restored after a raw
+ /// background pixel click.
+ ///
+@@ -946,9 +950,15 @@ impl Tool for ClickTool {
+                     let delivered = if focus_only {
+                         crate::input::ax_actions::focus_element(element as usize).is_ok()
+                     } else {
+-                        let press = core_foundation::string::CFString::new("AXPress");
+-                        AXUIElementPerformAction(element, press.as_concrete_TypeRef())
+-                            == kAXErrorSuccess
++                        let advertised = copy_action_names(element);
++                        let enabled = copy_bool_attr(element, "AXEnabled");
++                        if hit_test_ax_press_eligible(&advertised, enabled) {
++                            let press = core_foundation::string::CFString::new("AXPress");
++                            AXUIElementPerformAction(element, press.as_concrete_TypeRef())
++                                == kAXErrorSuccess
++                        } else {
++                            false
++                        }
+                     };
+                     CFRelease(element as _);
+                     Ok(delivered)
+@@ -1485,6 +1495,31 @@ fn perform_ax_click(
+     Ok((summary, needs_webkit_delay, suspected_noop, false, false))
+ }
+ 
++#[cfg(test)]
++mod hit_test_ax_press_tests {
++    use super::hit_test_ax_press_eligible;
++
++    #[test]
++    fn requires_advertised_ax_press() {
++        assert!(hit_test_ax_press_eligible(
++            &["AXPress".to_owned()],
++            Some(true)
++        ));
++        assert!(!hit_test_ax_press_eligible(
++            &["AXShowMenu".to_owned()],
++            Some(true)
++        ));
++        assert!(!hit_test_ax_press_eligible(&[], Some(true)));
++    }
++
++    #[test]
++    fn refuses_explicitly_disabled_but_allows_unreported_enabled_state() {
++        let actions = ["AXPress".to_owned()];
++        assert!(!hit_test_ax_press_eligible(&actions, Some(false)));
++        assert!(hit_test_ax_press_eligible(&actions, None));
++    }
++}
++
+ #[cfg(test)]
+ mod selection_fallback_tests {
+     use super::selection_readback_confirms;

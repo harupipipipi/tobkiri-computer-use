@@ -1,0 +1,499 @@
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/input/mouse.rs b/libs/cua-driver/rust/crates/platform-macos/src/input/mouse.rs
+index 0319e19..0bfc7ea 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/input/mouse.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/input/mouse.rs
+@@ -19,10 +19,9 @@ use foreign_types::ForeignType;
+ 
+ #[derive(Clone, Copy)]
+ enum MousePostMode {
+-    Both,
+     /// Deliver one event through SkyLight, using the public PID route only when
+-    /// the private symbol is unavailable. A drag must use one route throughout
+-    /// so a receiver that accepts both does not observe two gestures.
++    /// the private symbol is unavailable. One gesture must use one route
++    /// throughout so a receiver that accepts both does not observe duplicates.
+     SkyLightWithPublicFallback,
+     PublicOnly,
+ }
+@@ -51,6 +50,26 @@ where
+     }
+ }
+ 
++fn post_pid_route<PrivatePost, PublicPost>(
++    mode: MousePostMode,
++    private_post: PrivatePost,
++    public_post: PublicPost,
++) -> SinglePostRoute
++where
++    PrivatePost: FnOnce() -> bool,
++    PublicPost: FnOnce(),
++{
++    match mode {
++        MousePostMode::SkyLightWithPublicFallback => {
++            post_single_pid_route(private_post, public_post)
++        }
++        MousePostMode::PublicOnly => {
++            public_post();
++            SinglePostRoute::Public
++        }
++    }
++}
++
+ #[derive(Clone, Copy)]
+ pub enum WindowClickDelivery {
+     Background,
+@@ -65,6 +84,13 @@ impl WindowClickDelivery {
+             Self::Background
+         }
+     }
++
++    fn post_mode(self) -> MousePostMode {
++        match self {
++            Self::Background => MousePostMode::SkyLightWithPublicFallback,
++            Self::Foreground => MousePostMode::PublicOnly,
++        }
++    }
+ }
+ 
+ /// Left-click at `(x, y)` screen coordinates, posted to `pid`.
+@@ -79,7 +105,16 @@ pub fn click_at_xy(
+     count: usize,
+     modifiers: &[&str],
+ ) -> anyhow::Result<()> {
+-    click_at_xy_inner(pid, x, y, None, None, count, modifiers, MousePostMode::Both)
++    click_at_xy_inner(
++        pid,
++        x,
++        y,
++        None,
++        None,
++        count,
++        modifiers,
++        MousePostMode::SkyLightWithPublicFallback,
++    )
+ }
+ 
+ /// Screen-absolute click posted to the GLOBAL HID tap (`CGEventTapLocation::HID`),
+@@ -333,7 +368,6 @@ fn click_at_xy_inner(
+         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+     let point = CGPoint::new(x, y);
+     let flags = parse_modifier_flags(modifiers);
+-
+     // Shared click-group ID (f58) when window_id is known: keeps all pairs
+     // in one gesture so WindowServer / Chromium coalesce them correctly.
+     let click_group_id: Option<i64> = wid.map(|_| {
+@@ -951,11 +985,18 @@ pub enum DragButton {
+ /// Middle-click at `(x, y)` with optional modifier keys.
+ ///
+ /// Posts an `OtherMouseDown` / `OtherMouseUp` pair with `CGMouseButton::Center`
+-/// to the target pid through the same SkyLight + public-API postBoth path the
+-/// left- and right-click primitives use. Window-local stamping mirrors
+-/// `right_click_at_xy_with_window_local`.
++/// to the target pid through one explicit delivery route. Window-local stamping
++/// mirrors `right_click_at_xy_with_window_local`.
+ pub fn middle_click_at_xy(pid: i32, x: f64, y: f64, modifiers: &[&str]) -> anyhow::Result<()> {
+-    middle_click_at_xy_inner(pid, x, y, None, modifiers)
++    middle_click_at_xy_inner(
++        pid,
++        x,
++        y,
++        None,
++        None,
++        modifiers,
++        WindowClickDelivery::Background,
++    )
+ }
+ 
+ /// Like `middle_click_at_xy` but stamps the window-local `(wx, wy)` point.
+@@ -965,9 +1006,11 @@ pub fn middle_click_at_xy_with_window_local(
+     y: f64,
+     wx: f64,
+     wy: f64,
++    wid: u32,
+     modifiers: &[&str],
++    delivery: WindowClickDelivery,
+ ) -> anyhow::Result<()> {
+-    middle_click_at_xy_inner(pid, x, y, Some((wx, wy)), modifiers)
++    middle_click_at_xy_inner(pid, x, y, Some((wx, wy)), Some(wid), modifiers, delivery)
+ }
+ 
+ fn middle_click_at_xy_inner(
+@@ -975,12 +1018,20 @@ fn middle_click_at_xy_inner(
+     x: f64,
+     y: f64,
+     window_local: Option<(f64, f64)>,
++    wid: Option<u32>,
+     modifiers: &[&str],
++    delivery: WindowClickDelivery,
+ ) -> anyhow::Result<()> {
+     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+     let point = CGPoint::new(x, y);
+     let flags = parse_modifier_flags(modifiers);
++    let click_group_id = wid.map(|_| {
++        std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .unwrap_or_default()
++            .subsec_nanos() as i64
++    });
+ 
+     let down = CGEvent::new_mouse_event(
+         source.clone(),
+@@ -992,7 +1043,17 @@ fn middle_click_at_xy_inner(
+     if flags != CGEventFlags::CGEventFlagNull {
+         down.set_flags(flags);
+     }
+-    post_mouse_event(pid, &down, window_local, None, None, 1, 2, 3);
++    post_mouse_event_with_mode(
++        pid,
++        &down,
++        window_local,
++        wid,
++        click_group_id,
++        1,
++        2,
++        3,
++        delivery.post_mode(),
++    );
+     std::thread::sleep(std::time::Duration::from_millis(16));
+ 
+     let up = CGEvent::new_mouse_event(
+@@ -1005,14 +1066,32 @@ fn middle_click_at_xy_inner(
+     if flags != CGEventFlags::CGEventFlagNull {
+         up.set_flags(flags);
+     }
+-    post_mouse_event(pid, &up, window_local, None, None, 1, 2, 3);
++    post_mouse_event_with_mode(
++        pid,
++        &up,
++        window_local,
++        wid,
++        click_group_id,
++        1,
++        2,
++        3,
++        delivery.post_mode(),
++    );
+ 
+     Ok(())
+ }
+ 
+ /// Right-click at `(x, y)` with optional modifier keys (no window routing).
+ pub fn right_click_at_xy(pid: i32, x: f64, y: f64, modifiers: &[&str]) -> anyhow::Result<()> {
+-    right_click_at_xy_inner(pid, x, y, None, None, modifiers)
++    right_click_at_xy_inner(
++        pid,
++        x,
++        y,
++        None,
++        None,
++        modifiers,
++        WindowClickDelivery::Background,
++    )
+ }
+ 
+ /// Like `right_click_at_xy` but stamps `CGEventSetWindowLocation` with the
+@@ -1032,8 +1111,9 @@ pub fn right_click_at_xy_with_window_local(
+     wy: f64,
+     wid: u32,
+     modifiers: &[&str],
++    delivery: WindowClickDelivery,
+ ) -> anyhow::Result<()> {
+-    right_click_at_xy_inner(pid, x, y, Some((wx, wy)), Some(wid), modifiers)
++    right_click_at_xy_inner(pid, x, y, Some((wx, wy)), Some(wid), modifiers, delivery)
+ }
+ 
+ fn right_click_at_xy_inner(
+@@ -1043,6 +1123,7 @@ fn right_click_at_xy_inner(
+     window_local: Option<(f64, f64)>,
+     wid: Option<u32>,
+     modifiers: &[&str],
++    delivery: WindowClickDelivery,
+ ) -> anyhow::Result<()> {
+     use std::time::{SystemTime, UNIX_EPOCH};
+ 
+@@ -1067,7 +1148,7 @@ fn right_click_at_xy_inner(
+         window_local,
+         wid,
+         click_group_id,
+-        MousePostMode::Both,
++        delivery.post_mode(),
+     );
+     std::thread::sleep(std::time::Duration::from_millis(12));
+ 
+@@ -1083,7 +1164,17 @@ fn right_click_at_xy_inner(
+     }
+     // button_number = 1 (right). Stamping 0 here routes the event as a left
+     // button-number on the receiving side even though the type is rightMouseDown.
+-    post_mouse_event(pid, &down, window_local, wid, click_group_id, 1, 1, 3);
++    post_mouse_event_with_mode(
++        pid,
++        &down,
++        window_local,
++        wid,
++        click_group_id,
++        1,
++        1,
++        3,
++        delivery.post_mode(),
++    );
+     std::thread::sleep(std::time::Duration::from_millis(28));
+ 
+     let up = CGEvent::new_mouse_event(
+@@ -1096,19 +1187,27 @@ fn right_click_at_xy_inner(
+     if flags != CGEventFlags::CGEventFlagNull {
+         up.set_flags(flags);
+     }
+-    post_mouse_event(pid, &up, window_local, wid, click_group_id, 1, 1, 3);
++    post_mouse_event_with_mode(
++        pid,
++        &up,
++        window_local,
++        wid,
++        click_group_id,
++        1,
++        1,
++        3,
++        delivery.post_mode(),
++    );
+ 
+     Ok(())
+ }
+ 
+ /// Post a mouse event to `pid`.
+ ///
+-/// Matches Swift's `MouseInput.postBoth(_:toPid:)`:
+-/// - Fires `SLEventPostToPid` (SkyLight path — reaches backgrounded Chromium/Catalyst).
+-/// - Also fires `CGEvent::post_to_pid` (public path — lands on AppKit targets where
+-///   SkyLight mouse delivery drops).
+-///
+-/// Both are always posted in sequence regardless of whether the other succeeded.
++/// Background callers attempt `SLEventPostToPid` once and use
++/// `CGEvent::post_to_pid` only when the SkyLight symbol is unavailable. The
++/// private void API does not acknowledge application receipt, so a second
++/// public post after invoking it would be duplicate delivery, not a safe retry.
+ ///
+ /// Field stamps applied (always):
+ /// - f40 = `pid`  (Chromium's synthetic-event filter)
+@@ -1175,7 +1274,7 @@ pub(super) fn post_mouse_event(
+         click_state,
+         button_number,
+         subtype,
+-        MousePostMode::Both,
++        MousePostMode::SkyLightWithPublicFallback,
+     );
+ }
+ 
+@@ -1216,20 +1315,11 @@ fn post_mouse_event_with_mode(
+     // Always stamp f40 = target pid (Chromium synthetic-event filter).
+     crate::input::skylight::set_integer_field(event_ptr, 40, pid as i64);
+ 
+-    match mode {
+-        MousePostMode::Both => {
+-            // Preserve the established transport for non-left-click callers.
+-            crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
+-            event.post_to_pid(pid as libc::pid_t);
+-        }
+-        MousePostMode::SkyLightWithPublicFallback => {
+-            let _route = post_single_pid_route(
+-                || crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false),
+-                || event.post_to_pid(pid as libc::pid_t),
+-            );
+-        }
+-        MousePostMode::PublicOnly => event.post_to_pid(pid as libc::pid_t),
+-    }
++    let _route = post_pid_route(
++        mode,
++        || crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false),
++        || event.post_to_pid(pid as libc::pid_t),
++    );
+ }
+ 
+ /// Post a stamped `mouseMoved` to `pid` at `point` before a down/up pair.
+@@ -1303,6 +1393,7 @@ pub fn scroll_wheel_at_xy(
+     delta_y_per_tick: i32,
+     delta_x_per_tick: i32,
+     ticks: usize,
++    delivery: WindowClickDelivery,
+ ) -> anyhow::Result<()> {
+     use core_graphics::event::ScrollEventUnit;
+ 
+@@ -1324,7 +1415,7 @@ pub fn scroll_wheel_at_xy(
+                 .unwrap_or_default()
+                 .subsec_nanos() as i64,
+         ),
+-        MousePostMode::Both,
++        delivery.post_mode(),
+     );
+     std::thread::sleep(std::time::Duration::from_millis(12));
+ 
+@@ -1363,10 +1454,11 @@ pub fn scroll_wheel_at_xy(
+         // f40 = target pid (Chromium synthetic-event filter).
+         crate::input::skylight::set_integer_field(event_ptr, 40, pid as i64);
+ 
+-        // Belt+suspenders post: SkyLight reaches backgrounded Chromium/Catalyst;
+-        // the public path lands on AppKit/WKWebView. Mouse-class → no auth envelope.
+-        crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
+-        event.post_to_pid(pid as libc::pid_t);
++        let _route = post_pid_route(
++            delivery.post_mode(),
++            || crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false),
++            || event.post_to_pid(pid as libc::pid_t),
++        );
+ 
+         std::thread::sleep(std::time::Duration::from_millis(30));
+     }
+@@ -1399,7 +1491,7 @@ fn parse_modifier_flags(modifiers: &[&str]) -> CGEventFlags {
+ 
+ #[cfg(test)]
+ mod single_pid_drag_route_tests {
+-    use super::{post_single_pid_route, SinglePostRoute};
++    use super::{post_pid_route, post_single_pid_route, SinglePostRoute, WindowClickDelivery};
+     use std::cell::Cell;
+ 
+     #[test]
+@@ -1459,4 +1551,40 @@ mod single_pid_drag_route_tests {
+         assert_eq!(public_calls.get(), 0);
+         assert_eq!(private_calls.get() + public_calls.get(), native_event_count,);
+     }
++
++    #[test]
++    fn background_delivery_uses_one_skylight_post_when_available() {
++        let private_calls = Cell::new(0);
++        let public_calls = Cell::new(0);
++
++        let route = post_pid_route(
++            WindowClickDelivery::Background.post_mode(),
++            || {
++                private_calls.set(private_calls.get() + 1);
++                true
++            },
++            || public_calls.set(public_calls.get() + 1),
++        );
++
++        assert_eq!(route, SinglePostRoute::SkyLight);
++        assert_eq!((private_calls.get(), public_calls.get()), (1, 0));
++    }
++
++    #[test]
++    fn foreground_delivery_is_public_only() {
++        let private_calls = Cell::new(0);
++        let public_calls = Cell::new(0);
++
++        let route = post_pid_route(
++            WindowClickDelivery::Foreground.post_mode(),
++            || {
++                private_calls.set(private_calls.get() + 1);
++                true
++            },
++            || public_calls.set(public_calls.get() + 1),
++        );
++
++        assert_eq!(route, SinglePostRoute::Public);
++        assert_eq!((private_calls.get(), public_calls.get()), (0, 1));
++    }
+ }
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
+index 026dcab..c909f11 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
+@@ -511,7 +511,37 @@ impl Tool for ClickTool {
+                             },
+                         )
+                     } else {
+-                        crate::input::mouse::middle_click_at_xy(pid, cx, cy, &m)
++                        let (wx, wy) = crate::windows::window_bounds_by_id(wid)
++                            .map(|bounds| (cx - bounds.x, cy - bounds.y))
++                            .ok_or_else(|| {
++                                anyhow::anyhow!(
++                                    "middle-click target window {wid} has no live frame"
++                                )
++                            })?;
++                        let do_click = || {
++                            crate::input::mouse::middle_click_at_xy_with_window_local(
++                                pid,
++                                cx,
++                                cy,
++                                wx,
++                                wy,
++                                wid,
++                                &m,
++                                crate::input::mouse::WindowClickDelivery::from_foreground(
++                                    foreground,
++                                ),
++                            )
++                        };
++                        if foreground {
++                            crate::input::skylight::with_foreground_assist(
++                                pid as libc::pid_t,
++                                wid,
++                                do_click,
++                            )
++                            .map(|_| ())
++                        } else {
++                            do_click()
++                        }
+                     }
+                 })
+                 .await;
+@@ -1071,14 +1101,16 @@ impl Tool for ClickTool {
+                                     if let Some(wid) = window_id {
+                                         return crate::input::mouse::right_click_at_xy_with_window_local(
+                                             pid, screen_x, screen_y, win_local_x, win_local_y, wid, &m,
++                                            crate::input::mouse::WindowClickDelivery::from_foreground(fg),
+                                         );
+                                     }
+                                     crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
+                                 }
+                                 "middle" => {
+-                                    if let Some(_wid) = window_id {
++                                    if let Some(wid) = window_id {
+                                         return crate::input::mouse::middle_click_at_xy_with_window_local(
+-                                            pid, screen_x, screen_y, win_local_x, win_local_y, &m,
++                                            pid, screen_x, screen_y, win_local_x, win_local_y, wid, &m,
++                                            crate::input::mouse::WindowClickDelivery::from_foreground(fg),
+                                         );
+                                     }
+                                     crate::input::mouse::middle_click_at_xy(pid, screen_x, screen_y, &m)
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/right_click.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/right_click.rs
+index b59e458..3e294af 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/right_click.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/right_click.rs
+@@ -261,6 +261,7 @@ impl Tool for RightClickTool {
+                         win_local_y,
+                         wid,
+                         &m,
++                        crate::input::mouse::WindowClickDelivery::from_foreground(fg),
+                     )
+                 } else {
+                     crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
+@@ -334,7 +335,16 @@ fn ax_show_menu(element_ptr: usize, idx: usize, pid: i32, wid: u32) -> anyhow::R
+     let (wx, wy) = crate::windows::window_bounds_by_id(wid)
+         .map(|b| (cx - b.x, cy - b.y))
+         .unwrap_or((cx, cy));
+-    crate::input::mouse::right_click_at_xy_with_window_local(pid, cx, cy, wx, wy, wid, &[])?;
++    crate::input::mouse::right_click_at_xy_with_window_local(
++        pid,
++        cx,
++        cy,
++        wx,
++        wy,
++        wid,
++        &[],
++        crate::input::mouse::WindowClickDelivery::Background,
++    )?;
+     Ok(format!(
+         "Right-clicked [{idx}] {role} \"{title}\" at element center ({cx:.0}, {cy:.0}) \
+          (pixel right-click; element advertises no AXShowMenu)."
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/scroll.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/scroll.rs
+index fb9029f..2b90e02 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/scroll.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/scroll.rs
+@@ -542,6 +542,7 @@ impl Tool for ScrollTool {
+                                 delta_y,
+                                 delta_x,
+                                 amount_ticks,
++                                crate::input::mouse::WindowClickDelivery::from_foreground(fg),
+                             )
+                         };
+                         // Foreground rung: brief front → wheel → restore prior frontmost.

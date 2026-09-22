@@ -1,0 +1,318 @@
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/set_window_frame.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/set_window_frame.rs
+index c9b00f2..7076792 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/set_window_frame.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/set_window_frame.rs
+@@ -105,7 +105,7 @@ const FRAME_MUTATION_ORDER: [FrameMutation; 2] = [FrameMutation::Position, Frame
+ const POSITION_ONLY: [FrameMutation; 1] = [FrameMutation::Position];
+ const SIZE_ONLY: [FrameMutation; 1] = [FrameMutation::Size];
+ 
+-fn corrective_mutations(requested: Frame, observed: Frame) -> &'static [FrameMutation] {
++fn required_mutations(requested: Frame, observed: Frame) -> &'static [FrameMutation] {
+     const TOLERANCE: f64 = 2.0;
+     match (
+         requested.position_approximately_eq(observed, TOLERANCE),
+@@ -118,6 +118,17 @@ fn corrective_mutations(requested: Frame, observed: Frame) -> &'static [FrameMut
+     }
+ }
+ 
++fn unsupported_required_mutation(
++    mutations: &[FrameMutation],
++    position_settable: bool,
++    size_settable: bool,
++) -> Option<FrameMutation> {
++    mutations.iter().copied().find(|mutation| match mutation {
++        FrameMutation::Position => !position_settable,
++        FrameMutation::Size => !size_settable,
++    })
++}
++
+ fn window_server_frame(window_id: u32) -> Option<Frame> {
+     crate::windows::window_bounds_by_id(window_id).map(|bounds| Frame {
+         x: bounds.x,
+@@ -179,31 +190,57 @@ fn mutate_and_verify(input: &SetWindowFrameInput) -> Result<FrameOutcome, String
+ 
+         let result = if let Some(target) = target {
+             AXUIElementSetMessagingTimeout(target, 2.0);
+-            if !is_attribute_settable(target, "AXPosition") {
+-                Err(format!(
+-                    "window_id {window_id} does not expose a settable AXPosition"
+-                ))
+-            } else if !is_attribute_settable(target, "AXSize") {
+-                Err(format!(
+-                    "window_id {window_id} does not expose a settable AXSize"
+-                ))
+-            } else {
+-                let before = window_server_frame(window_id).ok_or_else(|| {
+-                    format!(
+-                        "could not read the current WindowServer frame of window_id {window_id}"
+-                    )
+-                });
+-                before.and_then(|before| {
+-                    let mut mutation_errors = Vec::new();
+-                    let apply_mutations = |mutations: &[FrameMutation]| {
+-                        let mut errors = Vec::new();
+-                        for mutation in mutations {
+-                            let (attribute, error) = match mutation {
+-                                FrameMutation::Position => (
++            let before = window_server_frame(window_id).ok_or_else(|| {
++                format!("could not read the current WindowServer frame of window_id {window_id}")
++            });
++            before.and_then(|before| {
++                let planned = required_mutations(requested, before);
++                let position_settable = planned.contains(&FrameMutation::Position)
++                    && is_attribute_settable(target, "AXPosition");
++                let size_settable = planned.contains(&FrameMutation::Size)
++                    && is_attribute_settable(target, "AXSize");
++                if let Some(unsupported) =
++                    unsupported_required_mutation(planned, position_settable, size_settable)
++                {
++                    let attribute = match unsupported {
++                        FrameMutation::Position => "AXPosition",
++                        FrameMutation::Size => "AXSize",
++                    };
++                    return Err(format!(
++                        "window_id {window_id} does not expose a settable {attribute}"
++                    ));
++                }
++                if planned.is_empty() {
++                    return Ok(FrameOutcome {
++                        requested,
++                        observed: Some(before),
++                        confirmed: true,
++                        changed: false,
++                        mutation_errors: Vec::new(),
++                    });
++                }
++
++                let mut mutation_errors = Vec::new();
++                let apply_mutations = |mutations: &[FrameMutation]| {
++                    let mut errors = Vec::new();
++                    for mutation in mutations {
++                        let (attribute, error) = match mutation {
++                            FrameMutation::Position => {
++                                if !is_attribute_settable(target, "AXPosition") {
++                                    errors.push("AXPosition is no longer settable".into());
++                                    continue;
++                                }
++                                (
+                                     "AXPosition",
+                                     set_point_attr(target, "AXPosition", requested.x, requested.y),
+-                                ),
+-                                FrameMutation::Size => (
++                                )
++                            }
++                            FrameMutation::Size => {
++                                if !is_attribute_settable(target, "AXSize") {
++                                    errors.push("AXSize is no longer settable".into());
++                                    continue;
++                                }
++                                (
+                                     "AXSize",
+                                     set_size_attr(
+                                         target,
+@@ -211,54 +248,51 @@ fn mutate_and_verify(input: &SetWindowFrameInput) -> Result<FrameOutcome, String
+                                         requested.width,
+                                         requested.height,
+                                     ),
+-                                ),
+-                            };
+-                            if error != kAXErrorSuccess {
+-                                errors
+-                                    .push(format!("{attribute} was rejected with AXError {error}"));
++                                )
+                             }
++                        };
++                        if error != kAXErrorSuccess {
++                            errors.push(format!("{attribute} was rejected with AXError {error}"));
+                         }
+-                        errors
+-                    };
+-                    mutation_errors.extend(apply_mutations(&FRAME_MUTATION_ORDER));
+-
+-                    let mut observed = None;
+-                    for attempt in 0..20 {
+-                        std::thread::sleep(std::time::Duration::from_millis(50));
+-
+-                        // Tahoe can settle either mutation while rolling the other one
+-                        // back. Correct only the component that still differs so the two
+-                        // writes converge instead of continually undoing each other.
+-                        if attempt < 6 {
+-                            if let Some(rect) = element_screen_rect(target) {
+-                                let corrections =
+-                                    corrective_mutations(requested, Frame::from_ax(rect));
+-                                mutation_errors.extend(apply_mutations(corrections));
+-                            }
++                    }
++                    errors
++                };
++                mutation_errors.extend(apply_mutations(planned));
++
++                let mut observed = None;
++                for attempt in 0..20 {
++                    std::thread::sleep(std::time::Duration::from_millis(50));
++
++                    // Tahoe can settle either mutation while rolling the other one
++                    // back. Correct only the component that still differs so the two
++                    // writes converge instead of continually undoing each other.
++                    if attempt < 6 {
++                        if let Some(rect) = element_screen_rect(target) {
++                            let corrections = required_mutations(requested, Frame::from_ax(rect));
++                            mutation_errors.extend(apply_mutations(corrections));
+                         }
++                    }
+ 
+-                        // Confirmation comes from WindowServer, not the AX values written
+-                        // above. This is also the coordinate source exposed by list_windows.
+-                        if let Some(frame) = window_server_frame(window_id) {
+-                            observed = Some(frame);
+-                            if frame.approximately_eq(requested, 2.0) {
+-                                break;
+-                            }
++                    // Confirmation comes from WindowServer, not the AX values written
++                    // above. This is also the coordinate source exposed by list_windows.
++                    if let Some(frame) = window_server_frame(window_id) {
++                        observed = Some(frame);
++                        if frame.approximately_eq(requested, 2.0) {
++                            break;
+                         }
+                     }
+-                    let confirmed =
+-                        observed.is_some_and(|frame| frame.approximately_eq(requested, 2.0));
+-                    let changed =
+-                        observed.is_some_and(|frame| !frame.approximately_eq(before, 2.0));
+-                    Ok(FrameOutcome {
+-                        requested,
+-                        observed,
+-                        confirmed,
+-                        changed,
+-                        mutation_errors,
+-                    })
++                }
++                let confirmed =
++                    observed.is_some_and(|frame| frame.approximately_eq(requested, 2.0));
++                let changed = observed.is_some_and(|frame| !frame.approximately_eq(before, 2.0));
++                Ok(FrameOutcome {
++                    requested,
++                    observed,
++                    confirmed,
++                    changed,
++                    mutation_errors,
+                 })
+-            }
++            })
+         } else {
+             Err(format!(
+                 "window_id {window_id} belongs to pid {pid} in WindowServer but has no matching AXWindow"
+@@ -406,7 +440,7 @@ mod tests {
+             height: 600.0,
+         };
+         assert_eq!(
+-            corrective_mutations(
++            required_mutations(
+                 requested,
+                 Frame {
+                     x: 30.0,
+@@ -417,7 +451,7 @@ mod tests {
+             &POSITION_ONLY
+         );
+         assert_eq!(
+-            corrective_mutations(
++            required_mutations(
+                 requested,
+                 Frame {
+                     width: 900.0,
+@@ -429,6 +463,94 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn fixed_size_window_can_plan_a_position_only_move() {
++        let before = Frame {
++            x: 10.0,
++            y: 20.0,
++            width: 800.0,
++            height: 600.0,
++        };
++        let requested = Frame {
++            x: 110.0,
++            y: 120.0,
++            ..before
++        };
++        let plan = required_mutations(requested, before);
++        assert_eq!(plan, &POSITION_ONLY);
++        assert_eq!(unsupported_required_mutation(plan, true, false), None);
++    }
++
++    #[test]
++    fn unsupported_actual_resize_is_rejected() {
++        let before = Frame {
++            x: 10.0,
++            y: 20.0,
++            width: 800.0,
++            height: 600.0,
++        };
++        let requested = Frame {
++            width: 900.0,
++            ..before
++        };
++        let plan = required_mutations(requested, before);
++        assert_eq!(plan, &SIZE_ONLY);
++        assert_eq!(
++            unsupported_required_mutation(plan, true, false),
++            Some(FrameMutation::Size)
++        );
++    }
++
++    #[test]
++    fn no_op_plan_requires_no_attributes_and_writes_nothing() {
++        let frame = Frame {
++            x: 10.0,
++            y: 20.0,
++            width: 800.0,
++            height: 600.0,
++        };
++        let plan = required_mutations(frame, frame);
++        assert!(plan.is_empty());
++        assert_eq!(unsupported_required_mutation(plan, false, false), None);
++    }
++
++    #[test]
++    fn mixed_mutation_plan_preserves_position_then_size_order() {
++        let before = Frame {
++            x: 10.0,
++            y: 20.0,
++            width: 800.0,
++            height: 600.0,
++        };
++        let requested = Frame {
++            x: 30.0,
++            width: 900.0,
++            ..before
++        };
++        assert_eq!(required_mutations(requested, before), &FRAME_MUTATION_ORDER);
++    }
++
++    #[test]
++    fn correction_can_restore_a_component_that_matched_initially() {
++        let before = Frame {
++            x: 10.0,
++            y: 20.0,
++            width: 800.0,
++            height: 600.0,
++        };
++        let requested = Frame { x: 30.0, ..before };
++        assert_eq!(required_mutations(requested, before), &POSITION_ONLY);
++        let settled = Frame {
++            x: 10.0,
++            width: 700.0,
++            ..before
++        };
++        assert_eq!(
++            required_mutations(requested, settled),
++            &FRAME_MUTATION_ORDER
++        );
++    }
++
+     #[test]
+     fn missing_frame_readback_is_unverifiable_without_fabricated_evidence() {
+         let frame = Frame {

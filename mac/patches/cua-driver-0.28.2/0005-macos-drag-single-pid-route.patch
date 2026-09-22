@@ -1,0 +1,183 @@
+--- a/libs/cua-driver/rust/crates/platform-macos/src/input/mouse.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/input/mouse.rs
+@@ -20,9 +20,37 @@
+ #[derive(Clone, Copy)]
+ enum MousePostMode {
+     Both,
++    /// Deliver one event through SkyLight, using the public PID route only when
++    /// the private symbol is unavailable. A drag must use one route throughout
++    /// so a receiver that accepts both does not observe two gestures.
++    SkyLightWithPublicFallback,
+     PublicOnly,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum SinglePostRoute {
++    SkyLight,
++    Public,
++}
++
++/// Run exactly one PID post. `private_post` returns whether the SkyLight symbol
++/// resolved and was invoked; the public route is used only when it did not.
++fn post_single_pid_route<PrivatePost, PublicPost>(
++    private_post: PrivatePost,
++    public_post: PublicPost,
++) -> SinglePostRoute
++where
++    PrivatePost: FnOnce() -> bool,
++    PublicPost: FnOnce(),
++{
++    if private_post() {
++        SinglePostRoute::SkyLight
++    } else {
++        public_post();
++        SinglePostRoute::Public
++    }
++}
++
+ #[derive(Clone, Copy)]
+ pub enum WindowClickDelivery {
+     Background,
+@@ -702,7 +730,7 @@
+     if flags != CGEventFlags::CGEventFlagNull {
+         up.set_flags(flags);
+     }
+-    post_mouse_event(
++    post_drag_mouse_event(
+         pid,
+         &down,
+         from_local,
+@@ -732,7 +760,7 @@
+             if flags != CGEventFlags::CGEventFlagNull {
+                 drag.set_flags(flags);
+             }
+-            post_mouse_event(pid, &drag, il, wid, click_group_id, 1, button_number, 0);
++            post_drag_mouse_event(pid, &drag, il, wid, click_group_id, 1, button_number, 0);
+             observe(ix, iy);
+             if step_delay_ms > 0 {
+                 std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
+@@ -745,7 +773,7 @@
+     // Give Chromium one run-loop turn to process the final dragged event at
+     // the drop point before releasing pointer capture.
+     std::thread::sleep(std::time::Duration::from_millis(50));
+-    post_mouse_event(pid, &up, to_local, wid, click_group_id, 1, button_number, 0);
++    post_drag_mouse_event(pid, &up, to_local, wid, click_group_id, 1, button_number, 0);
+     if foreground_release {
+         // A frontmost Chromium surface can consume PID-routed down/move
+         // events yet filter the synthetic release. Re-post only the release
+@@ -1099,6 +1127,34 @@
+ /// stamped with f3=0 routes as a left-click on the receiving side — this was the
+ /// right-click-lands-as-nothing bug). Left=0, Right=1, Middle=2.
+ // These arguments are the individual CGEvent fields stamped by this low-level primitive.
++/// Drag-only single-route dispatcher. SkyLight is the preferred background
++/// transport for Chromium/Catalyst and is also accepted by the tested AppKit
++/// fixture. The public PID route is a symbol-availability fallback, not an
++/// application-consumption acknowledgement.
++#[allow(clippy::too_many_arguments)]
++fn post_drag_mouse_event(
++    pid: i32,
++    event: &CGEvent,
++    window_local: Option<(f64, f64)>,
++    wid: Option<u32>,
++    click_group_id: Option<i64>,
++    click_state: i64,
++    button_number: i64,
++    subtype: i64,
++) {
++    post_mouse_event_with_mode(
++        pid,
++        event,
++        window_local,
++        wid,
++        click_group_id,
++        click_state,
++        button_number,
++        subtype,
++        MousePostMode::SkyLightWithPublicFallback,
++    );
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub(super) fn post_mouse_event(
+     pid: i32,
+@@ -1165,6 +1221,12 @@
+             // Preserve the established transport for non-left-click callers.
+             crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
+             event.post_to_pid(pid as libc::pid_t);
++        }
++        MousePostMode::SkyLightWithPublicFallback => {
++            let _route = post_single_pid_route(
++                || crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false),
++                || event.post_to_pid(pid as libc::pid_t),
++            );
+         }
+         MousePostMode::PublicOnly => event.post_to_pid(pid as libc::pid_t),
+     }
+@@ -1334,3 +1396,67 @@
+     }
+     flags
+ }
++
++#[cfg(test)]
++mod single_pid_drag_route_tests {
++    use super::{post_single_pid_route, SinglePostRoute};
++    use std::cell::Cell;
++
++    #[test]
++    fn skylight_success_posts_exactly_once_without_public_duplicate() {
++        let private_calls = Cell::new(0);
++        let public_calls = Cell::new(0);
++
++        let route = post_single_pid_route(
++            || {
++                private_calls.set(private_calls.get() + 1);
++                true
++            },
++            || public_calls.set(public_calls.get() + 1),
++        );
++
++        assert_eq!(route, SinglePostRoute::SkyLight);
++        assert_eq!(private_calls.get(), 1);
++        assert_eq!(public_calls.get(), 0);
++    }
++
++    #[test]
++    fn missing_skylight_uses_exactly_one_public_pid_post() {
++        let private_calls = Cell::new(0);
++        let public_calls = Cell::new(0);
++
++        let route = post_single_pid_route(
++            || {
++                private_calls.set(private_calls.get() + 1);
++                false
++            },
++            || public_calls.set(public_calls.get() + 1),
++        );
++
++        assert_eq!(route, SinglePostRoute::Public);
++        assert_eq!(private_calls.get(), 1);
++        assert_eq!(public_calls.get(), 1);
++    }
++
++    #[test]
++    fn drag_sequence_posts_one_transport_call_per_native_event() {
++        let private_calls = Cell::new(0);
++        let public_calls = Cell::new(0);
++        let native_event_count = 7; // down + five dragged events + up
++
++        for _ in 0..native_event_count {
++            let route = post_single_pid_route(
++                || {
++                    private_calls.set(private_calls.get() + 1);
++                    true
++                },
++                || public_calls.set(public_calls.get() + 1),
++            );
++            assert_eq!(route, SinglePostRoute::SkyLight);
++        }
++
++        assert_eq!(private_calls.get(), native_event_count);
++        assert_eq!(public_calls.get(), 0);
++        assert_eq!(private_calls.get() + public_calls.get(), native_event_count,);
++    }
++}

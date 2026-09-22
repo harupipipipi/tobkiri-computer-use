@@ -1,0 +1,170 @@
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/drag.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/drag.rs
+@@ -27,6 +27,27 @@
+     pub state: Arc<ToolState>,
+ }
+ 
++/// A PID-routed drag is safe only while both endpoints remain inside the
++/// exact window frame whose capture supplied the coordinates.  CoreGraphics
++/// accepts arbitrary screen points; without this check a stale endpoint could
++/// hit a different surface even though the events carry a window id.
++fn drag_endpoints_within_window(
++    from_local: (f64, f64),
++    to_local: (f64, f64),
++    width: f64,
++    height: f64,
++) -> bool {
++    let inside = |(x, y): (f64, f64)| {
++        x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0 && x < width && y < height
++    };
++    width.is_finite()
++        && height.is_finite()
++        && width > 0.0
++        && height > 0.0
++        && inside(from_local)
++        && inside(to_local)
++}
++
+ impl DragTool {
+     pub fn new(state: Arc<ToolState>) -> Self {
+         Self { state }
+@@ -49,6 +70,9 @@
+              mouseDragged events linearly interpolated along the path. Increase both for \
+              slower, more human drags; decrease for snap gestures.\n\n\
+              `modifier` keys (cmd/shift/option/ctrl) are held across the entire gesture.\n\n\
++             Background delivery requires one exact live window. It posts a PID- and \
++             window-routed CGEvent stream without moving the hardware cursor or deliberately \
++             activating the application; confirm the effect from a fresh snapshot.\n\n\
+              When `from_zoom` is true, coordinates are in the last zoom image for this \
+              pid; the driver maps them back to window coordinates before dispatching."
+             .into(),
+@@ -188,12 +212,21 @@
+         // that drop background CGEvents), via the same skylight assist click
+         // uses. Requires a window_id to have a window to front.
+         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
+-        if !delivery_mode.is_foreground() {
++        let window_id = match super::native_window_id(args.opt_u64("window_id")) {
++            Ok(window_id) => window_id,
++            Err(refusal) => return refusal,
++        };
++        if !delivery_mode.is_foreground() && window_id.is_none() {
+             return ToolResult::error(
+-                "Background drag is unavailable on macOS; use delivery_mode:\"foreground\"."
++                "Background drag requires an exact window_id. Re-list and re-snapshot the \
++                 target window before dragging."
+                     .to_owned(),
+             )
+-            .with_structured(serde_json::json!({ "code": "background_unavailable" }));
++            .with_structured(serde_json::json!({
++                "code": "exact_window_required",
++                "effect": "refused",
++                "pid": pid
++            }));
+         }
+         // Coerce integer or float from JSON for coordinate fields.
+         let coerce = |key: &str| -> Option<f64> {
+@@ -218,7 +251,6 @@
+             None => return ToolResult::error("Missing required parameter: to_y"),
+         };
+ 
+-        let window_id = args.opt_u64("window_id").map(|v| v as u32);
+         let duration_ms = args.u64_or("duration_ms", 500);
+         let steps = args.u64_or("steps", 20) as usize;
+         let from_zoom = args.bool_or("from_zoom", false);
+@@ -260,6 +292,27 @@
+             to_x *= ratio;
+             to_y *= ratio;
+         }
++
++        // Hold the same per-process coordinator used by the other exact-target
++        // background mutations from fresh target proof through dispatch,
++        // focus restoration and observation. This prevents two sibling-window
++        // gestures in one process from interleaving their routing state.
++        let _background_lease = if !delivery_mode.is_foreground() {
++            let wid = window_id.expect("background drag requires window_id above");
++            match super::gate_background_window_action(
++                pid,
++                wid,
++                None,
++                cua_driver_core::background_input::BackgroundAction::WindowPointer,
++            )
++            .await
++            {
++                Ok(lease) => Some(lease),
++                Err(refusal) => return refusal,
++            }
++        } else {
++            None
++        };
+ 
+         // Translate window-local screenshot pixels → screen coordinates, and
+         // window-local logical coords for CGEventSetWindowLocation. Both ends of
+@@ -270,6 +323,33 @@
+                     Ok(frame) => {
+                         let (fsx, fsy, flx, fly) = frame.to_screen(from_x, from_y);
+                         let (tsx, tsy, tlx, tly) = frame.to_screen(to_x, to_y);
++                        if !delivery_mode.is_foreground()
++                            && !drag_endpoints_within_window(
++                                (flx, fly),
++                                (tlx, tly),
++                                frame.bounds.width,
++                                frame.bounds.height,
++                            )
++                        {
++                            return ToolResult::error(format!(
++                                "drag endpoints ({flx:.1}, {fly:.1}) -> ({tlx:.1}, {tly:.1}) \
++                                 lie outside exact window {wid}'s {:.1}x{:.1} point frame; \
++                                 background delivery refused.",
++                                frame.bounds.width, frame.bounds.height
++                            ))
++                            .with_structured(serde_json::json!({
++                                "code": "drag_endpoint_outside_window",
++                                "effect": "refused",
++                                "pid": pid,
++                                "window_id": wid,
++                                "from_local": { "x": flx, "y": fly },
++                                "to_local": { "x": tlx, "y": tly },
++                                "window_size": {
++                                    "width": frame.bounds.width,
++                                    "height": frame.bounds.height
++                                }
++                            }));
++                        }
+                         (fsx, fsy, flx, fly, tsx, tsy, tlx, tly)
+                     }
+                     Err(refusal) => return refusal,
+@@ -441,3 +521,34 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::drag_endpoints_within_window;
++
++    #[test]
++    fn background_drag_accepts_only_finite_in_frame_endpoints() {
++        assert!(drag_endpoints_within_window(
++            (0.0, 0.0),
++            (639.999, 479.999),
++            640.0,
++            480.0
++        ));
++        for (from, to) in [
++            ((-0.1, 10.0), (20.0, 20.0)),
++            ((10.0, 10.0), (640.1, 20.0)),
++            ((10.0, 10.0), (640.0, 20.0)),
++            ((10.0, 10.0), (20.0, 480.0)),
++            ((10.0, f64::NAN), (20.0, 20.0)),
++            ((10.0, 10.0), (f64::INFINITY, 20.0)),
++        ] {
++            assert!(!drag_endpoints_within_window(from, to, 640.0, 480.0));
++        }
++        assert!(!drag_endpoints_within_window(
++            (1.0, 1.0),
++            (2.0, 2.0),
++            0.0,
++            480.0
++        ));
++    }
++}

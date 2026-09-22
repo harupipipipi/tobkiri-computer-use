@@ -1,0 +1,420 @@
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs b/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs
+index 02ba09c..70b493a 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs
+@@ -82,6 +82,7 @@ extern "C" {
+         timeout_in_seconds: f32,
+     ) -> AXError;
+     pub fn AXUIElementGetTypeID() -> CFTypeID;
++    pub fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut libc::pid_t) -> AXError;
+     pub fn AXIsProcessTrusted() -> bool;
+     /// `AXIsProcessTrustedWithOptions(options)` — when called with
+     /// `{kAXTrustedCheckOptionPrompt: true}` raises the system Accessibility
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
+index bd77bc9..0e62bc0 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
+@@ -135,6 +135,8 @@ unsafe fn extend_ax_window_records(
+     records: &mut Vec<AxWindowRecord>,
+     elements: Vec<AXUIElementRef>,
+     require_window_role: bool,
++    pid: i32,
++    target_window_id: u32,
+ ) {
+     for window in elements {
+         let eligible = !require_window_role
+@@ -146,6 +148,13 @@ unsafe fn extend_ax_window_records(
+                 minimized_conflict: false,
+             })
+         });
++        if record
++            .as_ref()
++            .and_then(Option::as_ref)
++            .is_some_and(|record| record.window_id == target_window_id)
++        {
++            super::exact_window_cache::remember_exact_window(pid, target_window_id, window);
++        }
+         CFRelease(window as CFTypeRef);
+         if let Some(Some(record)) = record {
+             merge_ax_window_record(records, record);
+@@ -161,10 +170,44 @@ unsafe fn extend_ax_window_records(
+ /// prevents an observed `(pid, CGWindowID)` from being rejected solely because
+ /// the mutation gate sampled the narrower attribute. Windows whose id the SPI
+ /// cannot resolve remain omitted and can never satisfy an exact-target check.
+-unsafe fn ax_window_records(app: AXUIElementRef) -> Vec<AxWindowRecord> {
++unsafe fn ax_window_records(
++    app: AXUIElementRef,
++    pid: i32,
++    target_window_id: u32,
++) -> Vec<AxWindowRecord> {
+     let mut records = Vec::new();
+-    extend_ax_window_records(&mut records, copy_children(app), true);
+-    extend_ax_window_records(&mut records, copy_ax_windows(app), false);
++    extend_ax_window_records(
++        &mut records,
++        copy_children(app),
++        true,
++        pid,
++        target_window_id,
++    );
++    extend_ax_window_records(
++        &mut records,
++        copy_ax_windows(app),
++        false,
++        pid,
++        target_window_id,
++    );
++    if !records
++        .iter()
++        .any(|record| record.window_id == target_window_id)
++    {
++        if let Some(window) =
++            super::exact_window_cache::resolve_exact_window_fallback(app, pid, target_window_id)
++        {
++            merge_ax_window_record(
++                &mut records,
++                AxWindowRecord {
++                    window_id: target_window_id,
++                    minimized: copy_bool_attr(window, "AXMinimized"),
++                    minimized_conflict: false,
++                },
++            );
++            CFRelease(window as CFTypeRef);
++        }
++    }
+     records
+ }
+ 
+@@ -227,7 +270,7 @@ pub fn gather_background_facts(
+             // Electron/Chromium apps may need per-process-lifetime enablement
+             // before their AX windows and subtrees are materialized.
+             super::enablement::ensure_chromium_ax_enabled(pid, app);
+-            let records = ax_window_records(app);
++            let records = ax_window_records(app, pid, window_id);
+             let app_hidden = copy_bool_attr(app, "AXHidden");
+             let element = element_ptr.map(|ptr| match element_window_id(ptr as AXUIElementRef) {
+                 Some(id) if id == window_id => ElementAncestry::ProvenDescendant,
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_window_cache.rs b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_window_cache.rs
+new file mode 100644
+index 0000000..9ed36e1
+--- /dev/null
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_window_cache.rs
+@@ -0,0 +1,267 @@
++//! Exact AX-window references retained across macOS Space transitions.
++//!
++//! AppKit can temporarily remove an off-Space window from both `AXChildren`
++//! and `AXWindows` while the already-created AX window proxy remains live.
++//! This cache never discovers or guesses a window. It only remembers a proxy
++//! that previously mapped to an exact `(pid, CGWindowID)`, then revalidates
++//! that same identity before every reuse.
++
++use std::collections::VecDeque;
++use std::sync::{Mutex, OnceLock};
++
++use core_foundation::base::{CFRelease, CFRetain, CFTypeRef};
++
++use super::bindings::{
++    ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorSuccess, AXUIElementGetPid,
++    AXUIElementRef, AXUIElementSetMessagingTimeout,
++};
++
++const MAX_RETAINED_WINDOWS: usize = 64;
++const AX_VALIDATION_TIMEOUT_SECONDS: f32 = 2.0;
++
++type ProcessStartStamp = (u64, u64);
++
++struct CachedWindow {
++    pid: i32,
++    window_id: u32,
++    process_start: ProcessStartStamp,
++    element: usize,
++}
++
++impl Drop for CachedWindow {
++    fn drop(&mut self) {
++        if self.element != 0 {
++            unsafe { CFRelease(self.element as AXUIElementRef as CFTypeRef) };
++        }
++    }
++}
++
++fn retained_windows() -> &'static Mutex<VecDeque<CachedWindow>> {
++    static WINDOWS: OnceLock<Mutex<VecDeque<CachedWindow>>> = OnceLock::new();
++    WINDOWS.get_or_init(|| Mutex::new(VecDeque::new()))
++}
++
++fn process_start_stamp(pid: i32) -> Option<ProcessStartStamp> {
++    unsafe {
++        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
++        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
++        let filled = libc::proc_pidinfo(
++            pid,
++            libc::PROC_PIDTBSDINFO,
++            0,
++            &mut info as *mut _ as *mut libc::c_void,
++            size,
++        );
++        (filled == size).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
++    }
++}
++
++#[derive(Debug, Clone, Copy)]
++struct CachedWindowFacts {
++    same_window_server_owner: bool,
++    explicitly_off_space: bool,
++    same_process_lifetime: bool,
++    ax_pid: Option<i32>,
++    ax_window_id: Option<u32>,
++    role_is_window: bool,
++}
++
++fn cached_window_is_admissible(facts: CachedWindowFacts, pid: i32, window_id: u32) -> bool {
++    facts.same_window_server_owner
++        && facts.explicitly_off_space
++        && facts.same_process_lifetime
++        && facts.ax_pid == Some(pid)
++        && facts.ax_window_id == Some(window_id)
++        && facts.role_is_window
++}
++
++unsafe fn native_identity(element: AXUIElementRef) -> (Option<i32>, Option<u32>, bool) {
++    let _ = AXUIElementSetMessagingTimeout(element, AX_VALIDATION_TIMEOUT_SECONDS);
++    let mut native_pid: libc::pid_t = 0;
++    let pid = (AXUIElementGetPid(element, &mut native_pid) == kAXErrorSuccess)
++        .then_some(native_pid as i32);
++    let window_id = ax_get_window_id(element);
++    let role_is_window = copy_string_attr(element, "AXRole").as_deref() == Some("AXWindow");
++    (pid, window_id, role_is_window)
++}
++
++fn evict(pid: i32, window_id: u32) {
++    if let Ok(mut windows) = retained_windows().lock() {
++        windows.retain(|entry| !(entry.pid == pid && entry.window_id == window_id));
++    }
++}
++
++fn window_server_reports_exact_off_space_owner(pid: i32, window_id: u32) -> bool {
++    crate::windows::all_windows().into_iter().any(|window| {
++        window.window_id == window_id && window.pid == pid && window.on_current_space == Some(false)
++    })
++}
++
++/// Remember a freshly enumerated, exact AX window.
++///
++/// Invalid/unreadable elements are never inserted. A process start stamp is
++/// mandatory so numeric PID reuse cannot inherit the old reference.
++pub unsafe fn remember_exact_window(pid: i32, window_id: u32, element: AXUIElementRef) {
++    let Some(process_start) = process_start_stamp(pid) else {
++        return;
++    };
++    let (ax_pid, ax_window_id, role_is_window) = native_identity(element);
++    if ax_pid != Some(pid) || ax_window_id != Some(window_id) || !role_is_window {
++        evict(pid, window_id);
++        return;
++    }
++
++    CFRetain(element as CFTypeRef);
++    let replacement = CachedWindow {
++        pid,
++        window_id,
++        process_start,
++        element: element as usize,
++    };
++    let Ok(mut windows) = retained_windows().lock() else {
++        drop(replacement);
++        return;
++    };
++    windows.retain(|entry| !(entry.pid == pid && entry.window_id == window_id));
++    windows.push_back(replacement);
++    while windows.len() > MAX_RETAINED_WINDOWS {
++        windows.pop_front();
++    }
++}
++
++/// Return a retained exact AX window only for an explicitly off-Space target.
++///
++/// The caller owns one retain and must `CFRelease` it. Current-Space,
++/// unknown-Space, closed, foreign-owner, relaunched-process, stale-AX, and
++/// identity-mismatch cases evict the entry and fail closed.
++pub unsafe fn cached_exact_window(pid: i32, window_id: u32) -> Option<AXUIElementRef> {
++    let exact_off_space_owner = window_server_reports_exact_off_space_owner(pid, window_id);
++    let observed_start = process_start_stamp(pid);
++
++    let (element, cached_start) = {
++        let mut windows = retained_windows().lock().ok()?;
++        let index = windows
++            .iter()
++            .position(|entry| entry.pid == pid && entry.window_id == window_id)?;
++        let entry = windows.remove(index)?;
++        let element = entry.element as AXUIElementRef;
++        let cached_start = entry.process_start;
++        CFRetain(element as CFTypeRef);
++        // Successful lookups refresh LRU order; time alone never rejects a
++        // still-live, exactly revalidated off-Space window.
++        windows.push_back(entry);
++        (element, cached_start)
++    };
++
++    let (ax_pid, ax_window_id, role_is_window) = native_identity(element);
++    let admissible = cached_window_is_admissible(
++        CachedWindowFacts {
++            same_window_server_owner: exact_off_space_owner,
++            explicitly_off_space: exact_off_space_owner,
++            same_process_lifetime: observed_start == Some(cached_start),
++            ax_pid,
++            ax_window_id,
++            role_is_window,
++        },
++        pid,
++        window_id,
++    );
++    if admissible {
++        Some(element)
++    } else {
++        CFRelease(element as CFTypeRef);
++        evict(pid, window_id);
++        None
++    }
++}
++
++/// Resolve an exact window from application-level references, then the retained
++/// off-Space cache.
++///
++/// `AXFocusedWindow` and `AXMainWindow` sometimes remain available when both
++/// top-level arrays are empty. They are admitted only after the same native
++/// pid/CGWindowID/role checks and a fresh WindowServer owner check; a sibling
++/// reference is simply ignored.
++pub unsafe fn resolve_exact_window_fallback(
++    app: AXUIElementRef,
++    pid: i32,
++    window_id: u32,
++) -> Option<AXUIElementRef> {
++    let explicitly_off_space = window_server_reports_exact_off_space_owner(pid, window_id);
++    if !explicitly_off_space {
++        evict(pid, window_id);
++        return None;
++    }
++    for attribute in ["AXFocusedWindow", "AXMainWindow"] {
++        let Some(window) = copy_element_attr(app, attribute) else {
++            continue;
++        };
++        let (ax_pid, ax_window_id, role_is_window) = native_identity(window);
++        if ax_pid == Some(pid) && ax_window_id == Some(window_id) && role_is_window {
++            remember_exact_window(pid, window_id, window);
++            return Some(window);
++        }
++        CFRelease(window as CFTypeRef);
++    }
++    cached_exact_window(pid, window_id)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{cached_window_is_admissible, CachedWindowFacts};
++
++    fn exact() -> CachedWindowFacts {
++        CachedWindowFacts {
++            same_window_server_owner: true,
++            explicitly_off_space: true,
++            same_process_lifetime: true,
++            ax_pid: Some(42),
++            ax_window_id: Some(99),
++            role_is_window: true,
++        }
++    }
++
++    #[test]
++    fn only_exact_live_off_space_identity_is_admitted() {
++        assert!(cached_window_is_admissible(exact(), 42, 99));
++    }
++
++    #[test]
++    fn closed_foreign_current_or_unknown_space_is_refused() {
++        for mutate in [
++            |facts: &mut CachedWindowFacts| facts.same_window_server_owner = false,
++            |facts: &mut CachedWindowFacts| facts.explicitly_off_space = false,
++        ] {
++            let mut facts = exact();
++            mutate(&mut facts);
++            assert!(!cached_window_is_admissible(facts, 42, 99));
++        }
++    }
++
++    #[test]
++    fn pid_reuse_and_every_ax_identity_failure_are_refused() {
++        let mut variants = Vec::new();
++        let mut facts = exact();
++        facts.same_process_lifetime = false;
++        variants.push(facts);
++        let mut facts = exact();
++        facts.ax_pid = Some(7);
++        variants.push(facts);
++        let mut facts = exact();
++        facts.ax_pid = None;
++        variants.push(facts);
++        let mut facts = exact();
++        facts.ax_window_id = Some(100);
++        variants.push(facts);
++        let mut facts = exact();
++        facts.ax_window_id = None;
++        variants.push(facts);
++        let mut facts = exact();
++        facts.role_is_window = false;
++        variants.push(facts);
++
++        for facts in variants {
++            assert!(!cached_window_is_admissible(facts, 42, 99));
++        }
++    }
++}
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/ax/mod.rs b/libs/cua-driver/rust/crates/platform-macos/src/ax/mod.rs
+index ee7b6c4..719c3ce 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/mod.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/mod.rs
+@@ -20,6 +20,7 @@ pub mod bindings;
+ pub mod cache;
+ pub mod enablement;
+ pub mod exact_target;
++pub(crate) mod exact_window_cache;
+ pub mod tree;
+ pub mod window_scope;
+ 
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/ax/tree.rs b/libs/cua-driver/rust/crates/platform-macos/src/ax/tree.rs
+index ee1f5d3..eb096b1 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/tree.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/tree.rs
+@@ -251,7 +251,7 @@ pub fn walk_tree_bounded(
+         // and walks nothing; it must never fall back to "everything that isn't
+         // a window", which is how issue #2237 returned menu bars as panels.
+         let walk_these: Vec<AXUIElementRef> = if let Some(wid) = window_id {
+-            let candidates: Vec<TopLevelCandidate> = top_level
++            let mut candidates: Vec<TopLevelCandidate> = top_level
+                 .iter()
+                 .map(|&child| {
+                     set_messaging_timeout(child);
+@@ -273,6 +273,25 @@ pub fn walk_tree_bounded(
+                     }
+                 })
+                 .collect();
++            if let Some(index) = candidates.iter().position(|candidate| {
++                candidate.role == "AXWindow" && candidate.ax_window_id == Some(wid)
++            }) {
++                super::exact_window_cache::remember_exact_window(pid, wid, top_level[index]);
++            } else if let Some(window) =
++                super::exact_window_cache::resolve_exact_window_fallback(app_elem, pid, wid)
++            {
++                set_messaging_timeout(window);
++                let role = copy_string_attr(window, "AXRole").unwrap_or_default();
++                let subrole = copy_string_attr(window, "AXSubrole");
++                let identifier = copy_string_attr(window, "AXIdentifier");
++                top_level.push(window);
++                candidates.push(TopLevelCandidate {
++                    role,
++                    subrole,
++                    identifier,
++                    ax_window_id: Some(wid),
++                });
++            }
+             let decision = decide_window_scope(&candidates, wid, || {
+                 crate::windows::resolve_window_owner(pid, wid)
+             });

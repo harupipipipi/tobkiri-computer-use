@@ -1,0 +1,705 @@
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs b/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs
+index 70b493a..8e941c0 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs
+@@ -29,6 +29,7 @@ pub type AXError = c_int;
+ pub const kAXErrorSuccess: AXError = 0;
+ pub const kAXErrorFailure: AXError = -25200;
+ pub const kAXErrorInvalidUIElement: AXError = -25202;
++pub const kAXErrorCannotComplete: AXError = -25204;
+ pub const kAXErrorAttributeUnsupported: AXError = -25205;
+ pub const kAXErrorNoValue: AXError = -25212;
+ pub const kAXErrorAPIDisabled: AXError = -25211;
+@@ -521,21 +522,44 @@ pub fn focused_window_id_of_pid(pid: i32) -> Option<u32> {
+ /// # Safety
+ ///
+ /// `element` must be valid, and the caller must release every returned element.
+-pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+-    let attr = CFStr::new("AXChildren");
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct AxTopLevelReadError {
++    pub operation: &'static str,
++    pub code: AXError,
++}
++
++impl AxTopLevelReadError {
++    pub fn is_app_unresponsive(self) -> bool {
++        self.code == kAXErrorCannotComplete
++    }
++}
++
++pub struct AxElementListRead {
++    pub elements: Vec<AXUIElementRef>,
++    pub error: Option<AXError>,
++}
++
++unsafe fn copy_element_list_attr(element: AXUIElementRef, attr_name: &str) -> AxElementListRead {
++    let attr = CFStr::new(attr_name);
+     let mut value: CFTypeRef = std::ptr::null();
+     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+     if err != kAXErrorSuccess || value.is_null() {
+-        return vec![];
++        return AxElementListRead {
++            elements: vec![],
++            error: (err != kAXErrorSuccess).then_some(err),
++        };
+     }
+     let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
+     if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
+         CFRelease(value);
+-        return vec![];
++        return AxElementListRead {
++            elements: vec![],
++            error: Some(kAXErrorFailure),
++        };
+     }
+     let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
+     let ax_type_id = AXUIElementGetTypeID();
+-    (0..arr.len())
++    let elements = (0..arr.len())
+         .filter_map(|i| {
+             let item = *arr.get(i)?;
+             if core_foundation::base::CFGetTypeID(item) == ax_type_id {
+@@ -546,7 +570,19 @@ pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+                 None
+             }
+         })
+-        .collect()
++        .collect();
++    AxElementListRead {
++        elements,
++        error: None,
++    }
++}
++
++pub unsafe fn copy_children_with_error(element: AXUIElementRef) -> AxElementListRead {
++    copy_element_list_attr(element, "AXChildren")
++}
++
++pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
++    copy_children_with_error(element).elements
+ }
+ 
+ /// Copy an AX element-valued attribute. The returned element is retained and
+@@ -723,30 +759,11 @@ pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
+ ///
+ /// `element` must be valid, and the caller must release every returned element.
+ pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+-    let attr = CFStr::new("AXWindows");
+-    let mut value: CFTypeRef = std::ptr::null();
+-    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+-    if err != kAXErrorSuccess || value.is_null() {
+-        return vec![];
+-    }
+-    let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
+-    if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
+-        CFRelease(value);
+-        return vec![];
+-    }
+-    let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
+-    let ax_type_id = AXUIElementGetTypeID();
+-    (0..arr.len())
+-        .filter_map(|i| {
+-            let item = *arr.get(i)?;
+-            if core_foundation::base::CFGetTypeID(item) == ax_type_id {
+-                CFRetain(item);
+-                Some(item as AXUIElementRef)
+-            } else {
+-                None
+-            }
+-        })
+-        .collect()
++    copy_ax_windows_with_error(element).elements
++}
++
++pub unsafe fn copy_ax_windows_with_error(element: AXUIElementRef) -> AxElementListRead {
++    copy_element_list_attr(element, "AXWindows")
+ }
+ 
+ #[cfg(test)]
+@@ -754,6 +771,22 @@ mod tests {
+     use super::*;
+     use core_foundation::{boolean::CFBoolean, number::CFNumber};
+ 
++    #[test]
++    fn only_cannot_complete_is_classified_as_app_unresponsive() {
++        assert!(AxTopLevelReadError {
++            operation: "AXWindows",
++            code: kAXErrorCannotComplete,
++        }
++        .is_app_unresponsive());
++        for code in [kAXErrorAttributeUnsupported, kAXErrorNoValue] {
++            assert!(!AxTopLevelReadError {
++                operation: "AXWindows",
++                code,
++            }
++            .is_app_unresponsive());
++        }
++    }
++
+     #[test]
+     fn binary_value_accepts_booleans_and_exact_zero_or_one() {
+         let true_value = CFBoolean::true_value();
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
+index 0e62bc0..7d417a0 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
+@@ -13,8 +13,9 @@ use cua_driver_core::background_input::{
+ };
+ 
+ use super::bindings::{
+-    ax_get_window_id, copy_ax_windows, copy_bool_attr, copy_children, copy_element_attr,
+-    copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
++    ax_get_window_id, copy_ax_windows_with_error, copy_bool_attr, copy_children_with_error,
++    copy_element_attr, copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication,
++    AXUIElementRef, AxTopLevelReadError,
+ };
+ use crate::windows::{all_windows, resolve_window_owner, WindowOwner};
+ 
+@@ -174,22 +175,22 @@ unsafe fn ax_window_records(
+     app: AXUIElementRef,
+     pid: i32,
+     target_window_id: u32,
+-) -> Vec<AxWindowRecord> {
++) -> (Vec<AxWindowRecord>, Vec<AxTopLevelReadError>) {
+     let mut records = Vec::new();
+-    extend_ax_window_records(
+-        &mut records,
+-        copy_children(app),
+-        true,
+-        pid,
+-        target_window_id,
+-    );
+-    extend_ax_window_records(
+-        &mut records,
+-        copy_ax_windows(app),
+-        false,
+-        pid,
+-        target_window_id,
+-    );
++    let children = copy_children_with_error(app);
++    let windows = copy_ax_windows_with_error(app);
++    let read_errors = [("AXChildren", children.error), ("AXWindows", windows.error)]
++        .into_iter()
++        .filter_map(|(operation, error)| {
++            let error = AxTopLevelReadError {
++                operation,
++                code: error?,
++            };
++            error.is_app_unresponsive().then_some(error)
++        })
++        .collect();
++    extend_ax_window_records(&mut records, children.elements, true, pid, target_window_id);
++    extend_ax_window_records(&mut records, windows.elements, false, pid, target_window_id);
+     if !records
+         .iter()
+         .any(|record| record.window_id == target_window_id)
+@@ -208,7 +209,22 @@ unsafe fn ax_window_records(
+             CFRelease(window as CFTypeRef);
+         }
+     }
+-    records
++    (records, read_errors)
++}
++
++pub struct GatheredBackgroundFacts {
++    pub facts: BackgroundTargetFacts,
++    pub ax_read_errors: Vec<AxTopLevelReadError>,
++}
++
++/// Report an AX timeout only when WindowServer still proves the exact owner
++/// and neither top-level AX source (nor the exact-window cache) resolved the
++/// target. A successful exact match from either source wins. WindowServer
++/// not-found/foreign-owner refusals remain the stronger diagnosis.
++pub fn unresolved_due_to_app_unresponsive(gathered: &GatheredBackgroundFacts) -> bool {
++    matches!(gathered.facts.window_server, WindowServerOwnership::SamePid)
++        && !gathered.facts.ax_window_present
++        && !gathered.ax_read_errors.is_empty()
+ }
+ 
+ /// Count independently AX-mapped, non-minimized sibling top-level windows.
+@@ -247,6 +263,14 @@ pub fn gather_background_facts(
+     window_id: u32,
+     element_ptr: Option<usize>,
+ ) -> BackgroundTargetFacts {
++    gather_background_facts_with_diagnostics(pid, window_id, element_ptr).facts
++}
++
++pub fn gather_background_facts_with_diagnostics(
++    pid: i32,
++    window_id: u32,
++    element_ptr: Option<usize>,
++) -> GatheredBackgroundFacts {
+     let window_server = match resolve_window_owner(pid, window_id) {
+         WindowOwner::SamePid => WindowServerOwnership::SamePid,
+         WindowOwner::Unknown => WindowServerOwnership::NotFound,
+@@ -258,19 +282,20 @@ pub fn gather_background_facts(
+     // SAFETY: the application element is created and released here; window
+     // elements are released inside ax_window_records; the caller guarantees
+     // element_ptr stays retained.
+-    let (records, app_hidden, element) = unsafe {
++    let (records, app_hidden, element, ax_read_errors) = unsafe {
+         let app = AXUIElementCreateApplication(pid);
+         if app.is_null() {
+             (
+                 Vec::new(),
+                 None,
+                 element_ptr.map(|_| ElementAncestry::Unproven),
++                Vec::new(),
+             )
+         } else {
+             // Electron/Chromium apps may need per-process-lifetime enablement
+             // before their AX windows and subtrees are materialized.
+             super::enablement::ensure_chromium_ax_enabled(pid, app);
+-            let records = ax_window_records(app, pid, window_id);
++            let (records, ax_read_errors) = ax_window_records(app, pid, window_id);
+             let app_hidden = copy_bool_attr(app, "AXHidden");
+             let element = element_ptr.map(|ptr| match element_window_id(ptr as AXUIElementRef) {
+                 Some(id) if id == window_id => ElementAncestry::ProvenDescendant,
+@@ -278,7 +303,7 @@ pub fn gather_background_facts(
+                 None => ElementAncestry::Unproven,
+             });
+             CFRelease(app as CFTypeRef);
+-            (records, app_hidden, element)
++            (records, app_hidden, element, ax_read_errors)
+         }
+     };
+ 
+@@ -292,19 +317,86 @@ pub fn gather_background_facts(
+         &records,
+     );
+ 
+-    BackgroundTargetFacts {
+-        window_server,
+-        ax_window_present: target.is_some(),
+-        target_minimized: target.and_then(|record| record.minimized),
+-        app_hidden,
+-        competing_keyboard_destinations,
+-        element: element.unwrap_or(ElementAncestry::NotAddressed),
++    GatheredBackgroundFacts {
++        facts: BackgroundTargetFacts {
++            window_server,
++            ax_window_present: target.is_some(),
++            target_minimized: target.and_then(|record| record.minimized),
++            app_hidden,
++            competing_keyboard_destinations,
++            element: element.unwrap_or(ElementAncestry::NotAddressed),
++        },
++        ax_read_errors,
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{count_competing_keyboard_destinations, merge_ax_window_record, AxWindowRecord};
++    use super::{
++        count_competing_keyboard_destinations, merge_ax_window_record,
++        unresolved_due_to_app_unresponsive, AxWindowRecord, GatheredBackgroundFacts,
++    };
++    use crate::ax::bindings::{kAXErrorCannotComplete, AxTopLevelReadError};
++    use cua_driver_core::background_input::{
++        BackgroundTargetFacts, ElementAncestry, WindowServerOwnership,
++    };
++
++    fn gathered(
++        owner: WindowServerOwnership,
++        target_present: bool,
++        has_timeout: bool,
++    ) -> GatheredBackgroundFacts {
++        GatheredBackgroundFacts {
++            facts: BackgroundTargetFacts {
++                window_server: owner,
++                ax_window_present: target_present,
++                target_minimized: None,
++                app_hidden: None,
++                competing_keyboard_destinations: 0,
++                element: ElementAncestry::NotAddressed,
++            },
++            ax_read_errors: has_timeout
++                .then_some(AxTopLevelReadError {
++                    operation: "AXWindows",
++                    code: kAXErrorCannotComplete,
++                })
++                .into_iter()
++                .collect(),
++        }
++    }
++
++    #[test]
++    fn exact_target_from_other_source_wins_over_one_timed_out_source() {
++        assert!(!unresolved_due_to_app_unresponsive(&gathered(
++            WindowServerOwnership::SamePid,
++            true,
++            true,
++        )));
++    }
++
++    #[test]
++    fn app_unresponsive_requires_same_owner_unresolved_target_and_timeout() {
++        assert!(unresolved_due_to_app_unresponsive(&gathered(
++            WindowServerOwnership::SamePid,
++            false,
++            true,
++        )));
++        assert!(!unresolved_due_to_app_unresponsive(&gathered(
++            WindowServerOwnership::SamePid,
++            false,
++            false,
++        )));
++        assert!(!unresolved_due_to_app_unresponsive(&gathered(
++            WindowServerOwnership::NotFound,
++            false,
++            true,
++        )));
++        assert!(!unresolved_due_to_app_unresponsive(&gathered(
++            WindowServerOwnership::ForeignPid { owner_pid: 7 },
++            false,
++            true,
++        )));
++    }
+ 
+     fn ax_window(window_id: u32, minimized: Option<bool>) -> AxWindowRecord {
+         AxWindowRecord {
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/ax/tree.rs b/libs/cua-driver/rust/crates/platform-macos/src/ax/tree.rs
+index eb096b1..1b7312b 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/tree.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/tree.rs
+@@ -146,6 +146,9 @@ pub struct TreeWalkResult {
+     /// [`WindowScope::Matched`] comes with an EMPTY walk, so `nodes` never
+     /// describes a window other than the requested one.
+     pub window_scope: Option<WindowScope>,
++    /// Top-level AX list operations which timed out because the target
++    /// application did not answer. Kept separate from a successful empty list.
++    pub ax_read_errors: Vec<AxTopLevelReadError>,
+ }
+ 
+ /// Walk the AX tree of `pid`, optionally filtered to a specific window.
+@@ -196,6 +199,7 @@ pub fn walk_tree_bounded(
+     // avoids a false-positive when the tree naturally ends on exactly the cap.
+     let mut truncated = false;
+     let mut window_scope: Option<WindowScope> = None;
++    let mut ax_read_errors = Vec::new();
+ 
+     unsafe {
+         let app_elem = AXUIElementCreateApplication(pid);
+@@ -207,6 +211,7 @@ pub fn walk_tree_bounded(
+                 // No application AX element at all, so a requested window
+                 // certainly did not resolve.
+                 window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
++                ax_read_errors,
+             };
+         }
+         set_messaging_timeout(app_elem);
+@@ -225,11 +230,25 @@ pub fn walk_tree_bounded(
+         // Union AXChildren + AXWindows — the only way to see background windows.
+         // AXChildren omits windows when the app isn't frontmost (AppKit limitation).
+         // AXWindows returns the window list regardless of activation state.
+-        let from_children = copy_children(app_elem);
+-        let from_windows = copy_ax_windows(app_elem);
++        let from_children = copy_children_with_error(app_elem);
++        let from_windows = copy_ax_windows_with_error(app_elem);
++        ax_read_errors.extend(
++            [
++                ("AXChildren", from_children.error),
++                ("AXWindows", from_windows.error),
++            ]
++            .into_iter()
++            .filter_map(|(operation, error)| {
++                let error = AxTopLevelReadError {
++                    operation,
++                    code: error?,
++                };
++                error.is_app_unresponsive().then_some(error)
++            }),
++        );
+ 
+-        let mut top_level = from_children;
+-        for w in from_windows {
++        let mut top_level = from_children.elements;
++        for w in from_windows.elements {
+             // AXChildren and AXWindows can return different proxy pointers for
+             // the same native window. CFEqual compares their AX identity;
+             // pointer equality alone duplicates the whole subtree and can turn
+@@ -353,6 +372,7 @@ pub fn walk_tree_bounded(
+         nodes,
+         truncated: truncated_flag,
+         window_scope,
++        ax_read_errors,
+     }
+ }
+ 
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/browser/setup_ui.rs b/libs/cua-driver/rust/crates/platform-macos/src/browser/setup_ui.rs
+index 0ba2abd..2f984c2 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/browser/setup_ui.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/browser/setup_ui.rs
+@@ -1748,6 +1748,7 @@ mod tests {
+             nodes,
+             truncated: false,
+             window_scope: Some(crate::ax::WindowScope::Matched),
++            ax_read_errors: Vec::new(),
+         }
+     }
+ 
+@@ -1876,6 +1877,7 @@ mod tests {
+             nodes: Vec::new(),
+             truncated: true,
+             window_scope: Some(crate::ax::WindowScope::Matched),
++            ax_read_errors: Vec::new(),
+         };
+         assert!(
+             exact_pixel_setup_checkbox(0, &truncated, 0, chrome(), false)
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/get_window_state.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/get_window_state.rs
+index 9078607..a15eb33 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/get_window_state.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/get_window_state.rs
+@@ -586,43 +586,66 @@ impl Tool for GetWindowStateTool {
+         // the screenshot already in this response and click by pixel (x,y).
+         // macOS can pixel-target in the background, so the recommendation is
+         // `px`, not `foreground`.
+-        match degradation_for(tree_result.is_some(), element_count, window_scope.as_ref()) {
+-            Degradation::None => {}
+-            Degradation::AxTreeEmpty => {
+-                structured["degraded"] = serde_json::json!(true);
+-                structured["degraded_reason"] = serde_json::json!(
+-                    "ax_tree_empty: the AX walk returned no actionable elements. The \
++        let unresolved_ax_errors = tree_result
++            .as_ref()
++            .filter(|result| {
++                matches!(
++                    result.window_scope,
++                    Some(crate::ax::window_scope::WindowScope::AxUnresolved { .. })
++                )
++            })
++            .map(|result| result.ax_read_errors.as_slice())
++            .unwrap_or(&[]);
++        if !unresolved_ax_errors.is_empty() {
++            structured["degraded"] = serde_json::json!(true);
++            structured["degraded_reason"] = serde_json::json!(
++                "ax_application_unresponsive: the target application's accessibility server did \
++                 not complete a top-level window query. The empty tree is not evidence that the \
++                 application has no AX windows."
++            );
++            structured["ax_read_errors"] = super::ax_read_errors_json(unresolved_ax_errors);
++            structured["suggestion"] = serde_json::json!(
++                "wait for the application to respond, then take a fresh snapshot"
++            );
++        } else {
++            match degradation_for(tree_result.is_some(), element_count, window_scope.as_ref()) {
++                Degradation::None => {}
++                Degradation::AxTreeEmpty => {
++                    structured["degraded"] = serde_json::json!(true);
++                    structured["degraded_reason"] = serde_json::json!(
++                        "ax_tree_empty: the AX walk returned no actionable elements. The \
+                      window may be a non-AX surface (canvas/WebGL/custom-drawn) or its \
+                      accessibility tree was not ready (Chromium/Electron require an \
+                      AX-enable + settle). Do not treat element data as authoritative — \
+                      re-snapshot if the app just launched, otherwise switch to the \
+                      visual path."
+-                );
+-                structured["escalation"] = serde_json::json!({
+-                    "recommended": "px",
+-                    "reason": "non-AX surface — act by pixel (x,y) off the screenshot \
+-                               in this response (an element px action)."
+-                });
+-            }
+-            Degradation::AxWindowUnresolved { ax_window_count } => {
+-                structured["degraded"] = serde_json::json!(true);
+-                structured["degraded_reason"] = serde_json::json!(format!(
+-                    "ax_window_unresolved: window_id {window_id} exists and is owned by \
++                    );
++                    structured["escalation"] = serde_json::json!({
++                        "recommended": "px",
++                        "reason": "non-AX surface — act by pixel (x,y) off the screenshot \
++                                   in this response (an element px action)."
++                    });
++                }
++                Degradation::AxWindowUnresolved { ax_window_count } => {
++                    structured["degraded"] = serde_json::json!(true);
++                    structured["degraded_reason"] = serde_json::json!(format!(
++                        "ax_window_unresolved: window_id {window_id} exists and is owned by \
+                      pid {pid}, but none of the {ax_window_count} AXWindow element(s) \
+                      under that pid reports this CGWindowID. The tree is returned EMPTY \
+                      on purpose: the accessibility elements reachable under this pid \
+                      belong to other surfaces (the menu bar, other windows), not to the \
+                      requested window, so presenting them would misground the next \
+                      action."
+-                ));
+-                structured["escalation"] = serde_json::json!({
+-                    "recommended": "foreground",
+-                    "reason": "observation-only: the screenshot in this response IS the \
+-                               requested window, but background input (including px) is \
+-                               refused while its AX surface is unresolved — events could \
+-                               reach a same-process sibling window. Re-snapshot after the \
+-                               app settles, or act with delivery_mode:\"foreground\"."
+-                });
++                    ));
++                    structured["escalation"] = serde_json::json!({
++                        "recommended": "foreground",
++                        "reason": "observation-only: the screenshot in this response IS the \
++                                   requested window, but background input (including px) is \
++                                   refused while its AX surface is unresolved — events could \
++                                   reach a same-process sibling window. Re-snapshot after the \
++                                   app settles, or act with delivery_mode:\"foreground\"."
++                    });
++                }
+             }
+         }
+         // Additive read-only `background_input` capability section (macOS
+@@ -633,12 +656,26 @@ impl Tool for GetWindowStateTool {
+         {
+             let capture_available = screenshot_dims.is_some();
+             let report = tokio::task::spawn_blocking(move || {
+-                let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
+-                cua_driver_core::background_input::background_input_capability_report(
+-                    cua_driver_core::background_input::ExactWindowTarget { pid, window_id },
+-                    &facts,
+-                    Some(capture_available),
+-                )
++                let gathered = crate::ax::exact_target::gather_background_facts_with_diagnostics(
++                    pid, window_id, None,
++                );
++                let mut report =
++                    cua_driver_core::background_input::background_input_capability_report(
++                        cua_driver_core::background_input::ExactWindowTarget { pid, window_id },
++                        &gathered.facts,
++                        Some(capture_available),
++                    );
++                if crate::ax::exact_target::unresolved_due_to_app_unresponsive(&gathered) {
++                    report["exact_window"]["status"] =
++                        serde_json::json!("ax_application_unresponsive");
++                    report["ax_read_errors"] = super::ax_read_errors_json(&gathered.ax_read_errors);
++                    if let Some(routes) = report["routes"].as_array_mut() {
++                        for route in routes {
++                            route["reason"] = serde_json::json!("ax_application_unresponsive");
++                        }
++                    }
++                }
++                report
+             })
+             .await;
+             if let Ok(report) = report {
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
+index ed38f1e..0560273 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
+@@ -230,6 +230,41 @@ pub(crate) fn background_refusal_result(
+     .with_structured(structured)
+ }
+ 
++pub(crate) fn ax_read_errors_json(
++    errors: &[crate::ax::bindings::AxTopLevelReadError],
++) -> serde_json::Value {
++    serde_json::Value::Array(
++        errors
++            .iter()
++            .map(|error| {
++                serde_json::json!({
++                    "operation": error.operation,
++                    "code": error.code,
++                })
++            })
++            .collect(),
++    )
++}
++
++pub(crate) fn ax_application_unresponsive_result(
++    pid: i32,
++    window_id: u32,
++    errors: &[crate::ax::bindings::AxTopLevelReadError],
++) -> cua_driver_core::protocol::ToolResult {
++    cua_driver_core::protocol::ToolResult::error(format!(
++        "Background input refused (ax_application_unresponsive): the accessibility server for \
++         pid {pid} did not complete a top-level window query; no input was sent"
++    ))
++    .with_structured(serde_json::json!({
++        "code": "ax_application_unresponsive",
++        "effect": "refused",
++        "pid": pid,
++        "window_id": window_id,
++        "ax_read_errors": ax_read_errors_json(errors),
++        "suggestion": "wait for the application to respond, then take a fresh snapshot",
++    }))
++}
++
+ /// Exclusive per-process ownership of one background mutation. Callers must
+ /// keep this value alive through actuator dispatch, focus restoration, and
+ /// target-bound verification.
+@@ -263,20 +298,35 @@ async fn decide_background_window_action(
+     };
+     let element_guard =
+         element_ptr.map(|ptr| unsafe { crate::ax::cache::RetainedElement::retain(ptr) });
+-    let facts = match tokio::task::spawn_blocking(move || {
++    let gathered = match tokio::task::spawn_blocking(move || {
+         let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
+-        crate::ax::exact_target::gather_background_facts(pid, window_id, element_ptr)
++        crate::ax::exact_target::gather_background_facts_with_diagnostics(
++            pid,
++            window_id,
++            element_ptr,
++        )
+     })
+     .await
+     {
+-        Ok(facts) => facts,
++        Ok(gathered) => gathered,
+         Err(error) => {
+             return Err(cua_driver_core::protocol::ToolResult::error(format!(
+                 "Could not gather exact-target facts for pid {pid} window {window_id}: {error}"
+             )));
+         }
+     };
+-    match decide_background_input(ExactWindowTarget { pid, window_id }, &facts, action) {
++    if crate::ax::exact_target::unresolved_due_to_app_unresponsive(&gathered) {
++        return Err(ax_application_unresponsive_result(
++            pid,
++            window_id,
++            &gathered.ax_read_errors,
++        ));
++    }
++    match decide_background_input(
++        ExactWindowTarget { pid, window_id },
++        &gathered.facts,
++        action,
++    ) {
+         BackgroundInputDecision::Execute { .. } => Ok(()),
+         BackgroundInputDecision::Refuse(refusal) => {
+             Err(background_refusal_result(pid, window_id, &refusal))
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/type_text.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/type_text.rs
+index b6c5977..f9a0098 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/type_text.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/type_text.rs
+@@ -793,19 +793,31 @@ async fn background_keyboard_policy(
+     let lease = super::acquire_background_mutation(pid).await;
+     let element_guard =
+         element_ptr.map(|ptr| unsafe { crate::ax::cache::RetainedElement::retain(ptr) });
+-    let facts = match tokio::task::spawn_blocking(move || {
++    let gathered = match tokio::task::spawn_blocking(move || {
+         let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
+-        crate::ax::exact_target::gather_background_facts(pid, window_id, element_ptr)
++        crate::ax::exact_target::gather_background_facts_with_diagnostics(
++            pid,
++            window_id,
++            element_ptr,
++        )
+     })
+     .await
+     {
+-        Ok(facts) => facts,
++        Ok(gathered) => gathered,
+         Err(error) => {
+             return Err(ToolResult::error(format!(
+                 "Could not gather exact-target facts for pid {pid} window {window_id}: {error}"
+             )));
+         }
+     };
++    if crate::ax::exact_target::unresolved_due_to_app_unresponsive(&gathered) {
++        return Err(super::ax_application_unresponsive_result(
++            pid,
++            window_id,
++            &gathered.ax_read_errors,
++        ));
++    }
++    let facts = gathered.facts;
+     let target = ExactWindowTarget { pid, window_id };
+     match decide_background_input(target, &facts, BackgroundAction::InsertText) {
+         BackgroundInputDecision::Execute { .. } => Ok((lease, BackgroundKeyboardPolicy::Allowed)),

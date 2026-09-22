@@ -1,0 +1,11 @@
+{
+  "backend": "tobkiri",
+  "app": "TobkiriDrawingFixture",
+  "window_title": "Tobkiri Drawing Fixture",
+  "output_dir": "{{MAC_ROOT}}/artifacts/luna-max/RUN",
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "max",
+  "skill": "{{MAC_ROOT}}/src/tobkiri_computer_use/skill/SKILL.md",
+  "prompt_sha256": "REPLACE_WITH_RENDERED_PROMPT_SHA256",
+  "evaluation_priority": "completed result, accuracy, and user non-interference; no speed score"
+}

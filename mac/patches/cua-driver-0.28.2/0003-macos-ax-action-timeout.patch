@@ -1,0 +1,45 @@
+From: Tobkiri exact-window audit
+Base: cua-driver-rs-v0.28.2 (fc188250b4ca8549b8e61f937fdb1fb560770e86)
+Subject: [PATCH 3/3] EXPERIMENTAL cua-driver: try a separate AX action timeout
+
+EXPERIMENTAL — do not apply this patch by default. The AX tree walker sets a
+two-second timeout on descendants that are then retained in the element cache.
+This patch tests the hypothesis that resetting the retained element to a
+bounded five-second mutation budget immediately before the single action RPC
+avoids an inherited observation timeout.
+
+Five seconds is an unvalidated diagnostic hypothesis, not a proven target
+latency. Accept or ship this patch only after signed native acceptance confirms
+the intended operation, its timing, and the absence of duplicated effects.
+
+This patch deliberately does not retry: AXUIElementPerformAction runs once and
+every non-success result, including kAXErrorCannotComplete and an unknown
+completion state, is returned unchanged to the caller.
+
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs b/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs
+index 02ba09c..1cdfccc 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs
+@@ -573,10 +573,22 @@ pub unsafe fn copy_element_attr(
+ 
+ /// Perform an AX action using a string attribute name.
+ ///
++/// The tree walker gives every cached descendant a short two-second messaging
++/// timeout so observation cannot strand a blocking worker. That timeout stays
++/// attached to the retained `AXUIElementRef`. Give the one mutation RPC a
++/// separate bounded budget before dispatch; otherwise a healthy but briefly
++/// busy AppKit target can inherit the observation budget and return
++/// `kAXErrorCannotComplete` before handling `AXPress`.
++///
++/// This does not retry an action. `AXUIElementPerformAction` is invoked exactly
++/// once and its native result is returned unchanged, so a timeout or unknown
++/// completion state is never converted to success or replayed.
+ /// # Safety
+ ///
+ /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+ pub unsafe fn perform_action(element: AXUIElementRef, action_name: &str) -> AXError {
++    const AX_ACTION_MESSAGING_TIMEOUT_SECONDS: f32 = 5.0;
++    let _ = AXUIElementSetMessagingTimeout(element, AX_ACTION_MESSAGING_TIMEOUT_SECONDS);
+     let action = CFStr::new(action_name);
+     AXUIElementPerformAction(element, action.as_concrete_TypeRef())
+ }

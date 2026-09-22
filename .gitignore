@@ -1,0 +1,26 @@
+.venv
+__pycache__/
+*.egg-info/
+.pytest_cache/
+build
+dist
+artifacts
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+
+# Local compatibility links for the original installation; source lives in mac/.
+/src
+/scripts
+/docs
+/patches
+/skills
+/benchmarks
+/provenance/
+
+# Original machine-specific benchmark prompts/configuration remain local.
+/mac/benchmarks/luna-max/runs/
+/mac/benchmarks/luna-max/prompt.md
+/mac/benchmarks/luna-max/quality-prompt.md

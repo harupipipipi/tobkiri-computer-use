@@ -1,0 +1,166 @@
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_window_cache.rs b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_window_cache.rs
+index 9ed36e1..28f662b 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_window_cache.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_window_cache.rs
+@@ -1,7 +1,8 @@
+-//! Exact AX-window references retained across macOS Space transitions.
++//! Exact AX-window references retained across transient AX-list disappearance.
+ //!
+-//! AppKit can temporarily remove an off-Space window from both `AXChildren`
+-//! and `AXWindows` while the already-created AX window proxy remains live.
++//! AppKit can temporarily remove a window from both `AXChildren` and
++//! `AXWindows` while the already-created AX window proxy remains live. This is
++//! observed across Space transitions and can also occur during focus routing.
+ //! This cache never discovers or guesses a window. It only remembers a proxy
+ //! that previously mapped to an exact `(pid, CGWindowID)`, then revalidates
+ //! that same identity before every reuse.
+@@ -59,7 +60,6 @@ fn process_start_stamp(pid: i32) -> Option<ProcessStartStamp> {
+ #[derive(Debug, Clone, Copy)]
+ struct CachedWindowFacts {
+     same_window_server_owner: bool,
+-    explicitly_off_space: bool,
+     same_process_lifetime: bool,
+     ax_pid: Option<i32>,
+     ax_window_id: Option<u32>,
+@@ -68,7 +68,6 @@ struct CachedWindowFacts {
+ 
+ fn cached_window_is_admissible(facts: CachedWindowFacts, pid: i32, window_id: u32) -> bool {
+     facts.same_window_server_owner
+-        && facts.explicitly_off_space
+         && facts.same_process_lifetime
+         && facts.ax_pid == Some(pid)
+         && facts.ax_window_id == Some(window_id)
+@@ -91,10 +90,23 @@ fn evict(pid: i32, window_id: u32) {
+     }
+ }
+ 
+-fn window_server_reports_exact_off_space_owner(pid: i32, window_id: u32) -> bool {
+-    crate::windows::all_windows().into_iter().any(|window| {
+-        window.window_id == window_id && window.pid == pid && window.on_current_space == Some(false)
+-    })
++fn exact_owner_in_rows(
++    rows: impl IntoIterator<Item = (i32, u32)>,
++    pid: i32,
++    window_id: u32,
++) -> bool {
++    rows.into_iter()
++        .any(|(owner_pid, candidate_id)| owner_pid == pid && candidate_id == window_id)
++}
++
++fn window_server_reports_exact_owner(pid: i32, window_id: u32) -> bool {
++    exact_owner_in_rows(
++        crate::windows::all_windows()
++            .into_iter()
++            .map(|window| (window.pid, window.window_id)),
++        pid,
++        window_id,
++    )
+ }
+ 
+ /// Remember a freshly enumerated, exact AX window.
+@@ -129,13 +141,14 @@ pub unsafe fn remember_exact_window(pid: i32, window_id: u32, element: AXUIEleme
+     }
+ }
+ 
+-/// Return a retained exact AX window only for an explicitly off-Space target.
++/// Return a retained AX window only while every exact identity remains live.
+ ///
+-/// The caller owns one retain and must `CFRelease` it. Current-Space,
+-/// unknown-Space, closed, foreign-owner, relaunched-process, stale-AX, and
+-/// identity-mismatch cases evict the entry and fail closed.
++/// The caller owns one retain and must `CFRelease` it. Closed, foreign-owner,
++/// relaunched-process, stale-AX, and identity-mismatch cases evict the entry and
++/// fail closed. Space membership is not an identity property: a current-Space
++/// or unknown-Space row still has to pass the same WindowServer and AX checks.
+ pub unsafe fn cached_exact_window(pid: i32, window_id: u32) -> Option<AXUIElementRef> {
+-    let exact_off_space_owner = window_server_reports_exact_off_space_owner(pid, window_id);
++    let exact_owner = window_server_reports_exact_owner(pid, window_id);
+     let observed_start = process_start_stamp(pid);
+ 
+     let (element, cached_start) = {
+@@ -148,7 +161,7 @@ pub unsafe fn cached_exact_window(pid: i32, window_id: u32) -> Option<AXUIElemen
+         let cached_start = entry.process_start;
+         CFRetain(element as CFTypeRef);
+         // Successful lookups refresh LRU order; time alone never rejects a
+-        // still-live, exactly revalidated off-Space window.
++        // still-live, exactly revalidated window.
+         windows.push_back(entry);
+         (element, cached_start)
+     };
+@@ -156,8 +169,7 @@ pub unsafe fn cached_exact_window(pid: i32, window_id: u32) -> Option<AXUIElemen
+     let (ax_pid, ax_window_id, role_is_window) = native_identity(element);
+     let admissible = cached_window_is_admissible(
+         CachedWindowFacts {
+-            same_window_server_owner: exact_off_space_owner,
+-            explicitly_off_space: exact_off_space_owner,
++            same_window_server_owner: exact_owner,
+             same_process_lifetime: observed_start == Some(cached_start),
+             ax_pid,
+             ax_window_id,
+@@ -176,7 +188,7 @@ pub unsafe fn cached_exact_window(pid: i32, window_id: u32) -> Option<AXUIElemen
+ }
+ 
+ /// Resolve an exact window from application-level references, then the retained
+-/// off-Space cache.
++/// exact-reference cache.
+ ///
+ /// `AXFocusedWindow` and `AXMainWindow` sometimes remain available when both
+ /// top-level arrays are empty. They are admitted only after the same native
+@@ -187,8 +199,7 @@ pub unsafe fn resolve_exact_window_fallback(
+     pid: i32,
+     window_id: u32,
+ ) -> Option<AXUIElementRef> {
+-    let explicitly_off_space = window_server_reports_exact_off_space_owner(pid, window_id);
+-    if !explicitly_off_space {
++    if !window_server_reports_exact_owner(pid, window_id) {
+         evict(pid, window_id);
+         return None;
+     }
+@@ -208,12 +219,11 @@ pub unsafe fn resolve_exact_window_fallback(
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{cached_window_is_admissible, CachedWindowFacts};
++    use super::{cached_window_is_admissible, exact_owner_in_rows, CachedWindowFacts};
+ 
+     fn exact() -> CachedWindowFacts {
+         CachedWindowFacts {
+             same_window_server_owner: true,
+-            explicitly_off_space: true,
+             same_process_lifetime: true,
+             ax_pid: Some(42),
+             ax_window_id: Some(99),
+@@ -222,20 +232,23 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn only_exact_live_off_space_identity_is_admitted() {
++    fn only_exact_live_identity_is_admitted() {
+         assert!(cached_window_is_admissible(exact(), 42, 99));
+     }
+ 
+     #[test]
+-    fn closed_foreign_current_or_unknown_space_is_refused() {
+-        for mutate in [
+-            |facts: &mut CachedWindowFacts| facts.same_window_server_owner = false,
+-            |facts: &mut CachedWindowFacts| facts.explicitly_off_space = false,
+-        ] {
+-            let mut facts = exact();
+-            mutate(&mut facts);
+-            assert!(!cached_window_is_admissible(facts, 42, 99));
+-        }
++    fn closed_or_foreign_window_server_owner_is_refused() {
++        let mut facts = exact();
++        facts.same_window_server_owner = false;
++        assert!(!cached_window_is_admissible(facts, 42, 99));
++    }
++
++    #[test]
++    fn exact_owner_check_depends_on_pid_and_window_id_not_space_metadata() {
++        let rows = [(7, 99), (42, 98), (42, 99)];
++        assert!(exact_owner_in_rows(rows, 42, 99));
++        assert!(!exact_owner_in_rows(rows, 42, 100));
++        assert!(!exact_owner_in_rows(rows, 7, 98));
+     }
+ 
+     #[test]

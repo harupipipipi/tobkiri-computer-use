@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tobkiri-computer-use"
+version = "0.1.14"
+description = "Python and MCP computer use with snapshot-bound targets and multiple agent cursors"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["Pillow>=10", "jsonschema>=4.20"]
+
+[project.urls]
+Repository = "https://github.com/harupipipipi/tobkiri-computer-use"
+Issues = "https://github.com/harupipipipi/tobkiri-computer-use/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+tobkiri-computer-use = "tobkiri_computer_use.reloadable:main"
+tobkiri-computer-use-reload = "tobkiri_computer_use.reloadable:reload_main"
+tobkiri-computer-use-setup = "tobkiri_computer_use.runtime:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tobkiri_computer_use = ["skill/SKILL.md", "skill/references/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

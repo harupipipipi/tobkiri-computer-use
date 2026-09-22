@@ -1,0 +1,497 @@
+--- a/libs/cua-driver/rust/crates/platform-macos/src/cursor/overlay.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/cursor/overlay.rs
+@@ -31,7 +31,8 @@
+ 
+ use std::collections::HashMap;
+ use std::ffi::c_void;
+-use std::sync::atomic::{AtomicU32, Ordering};
++use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++use std::sync::mpsc::TrySendError;
+ use std::sync::{Mutex, OnceLock};
+ use std::time::{Duration, Instant};
+ 
+@@ -47,23 +48,63 @@
+ // own cursor key. A new animation only supersedes the SAME key's prior waiter,
+ // so concurrent sessions never cross-cancel each other's arrivals.
+ 
+-static ARRIVAL_TX: Mutex<Option<HashMap<CursorKey, tokio::sync::oneshot::Sender<()>>>> =
+-    Mutex::new(None);
++const CURSOR_ARRIVAL_TIMEOUT: Duration = Duration::from_secs(15);
+ 
+-fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) {
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum CursorArrivalError {
++    QueueUnavailable,
++    QueueFull,
++    QueueDisconnected,
++    ArrivalCancelled,
++    TimedOut,
++}
++
++impl std::fmt::Display for CursorArrivalError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let message = match self {
++            Self::QueueUnavailable => "cursor overlay command queue is unavailable",
++            Self::QueueFull => "cursor overlay command queue is full",
++            Self::QueueDisconnected => "cursor overlay command queue is disconnected",
++            Self::ArrivalCancelled => "cursor overlay animation was superseded",
++            Self::TimedOut => "cursor overlay animation did not arrive before its deadline",
++        };
++        f.write_str(message)
++    }
++}
++
++struct ArrivalWaiter {
++    id: u64,
++    tx: tokio::sync::oneshot::Sender<()>,
++}
++
++static ARRIVAL_TX: Mutex<Option<HashMap<CursorKey, ArrivalWaiter>>> = Mutex::new(None);
++static NEXT_ARRIVAL_ID: AtomicU64 = AtomicU64::new(1);
++
++fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) -> u64 {
++    let id = NEXT_ARRIVAL_ID.fetch_add(1, Ordering::Relaxed);
+     let mut guard = ARRIVAL_TX.lock().unwrap();
+     let map = guard.get_or_insert_with(HashMap::new);
+-    // Cancel only the same key's previous waiter (superseded by new animation).
+-    if let Some(old_tx) = map.insert(key, tx) {
+-        let _ = old_tx.send(());
++    // Drop only the same key's previous waiter. Its receiver reports a
++    // cancellation rather than a false successful arrival.
++    let _ = map.insert(key, ArrivalWaiter { id, tx });
++    id
++}
++
++fn arrival_cancel(key: &CursorKey, id: u64) {
++    if let Ok(mut guard) = ARRIVAL_TX.lock() {
++        if let Some(map) = guard.as_mut() {
++            if map.get(key).is_some_and(|waiter| waiter.id == id) {
++                map.remove(key);
++            }
++        }
+     }
+ }
+ 
+ fn arrival_fire(key: &CursorKey) {
+     if let Ok(mut guard) = ARRIVAL_TX.lock() {
+         if let Some(map) = guard.as_mut() {
+-            if let Some(tx) = map.remove(key) {
+-                let _ = tx.send(());
++            if let Some(waiter) = map.remove(key) {
++                let _ = waiter.tx.send(());
+             }
+         }
+     }
+@@ -223,19 +264,30 @@
+     ));
+ }
+ 
+-/// Send a keyed command from any thread (MCP tool, etc.).  Non-blocking; drops
+-/// if the channel is full (old commands are less important than new ones).
+-pub fn send_command(key: CursorKey, cmd: OverlayCommand) {
++fn enqueue_cursor_command(
++    tx: Option<&std::sync::mpsc::SyncSender<OverlayMsg>>,
++    key: CursorKey,
++    cmd: OverlayCommand,
++) -> Result<(), CursorArrivalError> {
+     // Empty key is the explicit no-cursor sentinel for direct platform calls
+     // that bypass lifecycle dispatch.
+     if key.is_empty() {
+-        return;
++        return Ok(());
+     }
+-    if let Some(tx) = CMD_TX.get() {
+-        let _ = tx.try_send(OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }));
++    let tx = tx.ok_or(CursorArrivalError::QueueUnavailable)?;
++    match tx.try_send(OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd })) {
++        Ok(()) => Ok(()),
++        Err(TrySendError::Full(_)) => Err(CursorArrivalError::QueueFull),
++        Err(TrySendError::Disconnected(_)) => Err(CursorArrivalError::QueueDisconnected),
+     }
+ }
+ 
++/// Send a keyed command from any thread (MCP tool, etc.).  Non-blocking; drops
++/// if the channel is full (old commands are less important than new ones).
++pub fn send_command(key: CursorKey, cmd: OverlayCommand) {
++    let _ = enqueue_cursor_command(CMD_TX.get(), key, cmd);
++}
++
+ /// Convenience for callsites not yet threaded with a session key: drives the
+ /// seeded `"default"` cursor (the anonymous / one-shot identity).
+ pub fn send_command_default(cmd: OverlayCommand) {
+@@ -393,10 +445,10 @@
+ /// seeded on-screen via [`seed_start_if_sentinel`] so its FIRST action glides
+ /// in (it previously snapped silently via `ClickPulse`, invisible on a pure-AX
+ /// run).
+-pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
++pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) -> Result<(), CursorArrivalError> {
+     // Empty key is the explicit no-cursor sentinel → nothing to animate.
+     if key.is_empty() {
+-        return;
++        return Ok(());
+     }
+     // Seed a sentinel cursor on-screen so the MoveTo below glides instead of
+     // being short-circuited. After this the cursor's pos.0 > -50.0, so the
+@@ -413,17 +465,18 @@
+         )
+     };
+     if !should_animate {
+-        return;
++        return Ok(());
+     }
+ 
+     // Create a one-shot channel; store the sender (keyed) so the render thread
+     // can fire it when this cursor's path finishes.
+     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+-    arrival_register(key.clone(), tx);
++    let arrival_id = arrival_register(key.clone(), tx);
+ 
+     // Send the MoveTo command (click offset applied inside apply_command).
+-    send_command(
+-        key,
++    if let Err(error) = enqueue_cursor_command(
++        CMD_TX.get(),
++        key.clone(),
+         OverlayCommand::MoveTo {
+             x,
+             y,
+@@ -431,10 +484,23 @@
+             // convention and Swift reference (`endAngleDegrees: 45`).
+             end_heading_radians: std::f64::consts::FRAC_PI_4,
+         },
+-    );
++    ) {
++        arrival_cancel(&key, arrival_id);
++        return Err(error);
++    }
+ 
+     // Await arrival signal (fired from render thread when Dubins path ends).
+-    let _ = rx.await;
++    match tokio::time::timeout(CURSOR_ARRIVAL_TIMEOUT, rx).await {
++        Ok(Ok(())) => Ok(()),
++        Ok(Err(_)) => {
++            arrival_cancel(&key, arrival_id);
++            Err(CursorArrivalError::ArrivalCancelled)
++        }
++        Err(_) => {
++            arrival_cancel(&key, arrival_id);
++            Err(CursorArrivalError::TimedOut)
++        }
++    }
+ }
+ 
+ /// Block the calling thread (must be the OS main thread) running the AppKit
+@@ -1547,10 +1613,78 @@
+         assert!(
+             !render_map_needs_frame_tick(&map),
+             "fully hidden idle cursor should quiesce"
++        );
++    }
++
++    #[test]
++    fn same_point_one_millisecond_glide_signals_arrival() {
++        let mut state = RenderState::new(CursorConfig::default());
++        let click_offset = 16.0 * std::f64::consts::FRAC_PI_4.cos();
++        state.core.pos = (100.0 + click_offset, 200.0 + click_offset);
++        state.core.motion.glide_duration_ms = 1.0;
++        state.apply_command(OverlayCommand::MoveTo {
++            x: 100.0,
++            y: 200.0,
++            end_heading_radians: std::f64::consts::FRAC_PI_4,
++        });
++
++        assert!(
++            state.tick(0.002),
++            "same-point fallback path must signal arrival on a normal frame"
++        );
++    }
++
++    #[test]
++    fn bounded_enqueue_refuses_unavailable_and_full_queue() {
++        let (tx, _rx) = std::sync::mpsc::sync_channel::<OverlayMsg>(1);
++        assert_eq!(
++            enqueue_cursor_command(
++                Some(&tx),
++                "first".to_owned(),
++                OverlayCommand::SetEnabled(true),
++            ),
++            Ok(())
+         );
++        assert_eq!(
++            enqueue_cursor_command(
++                Some(&tx),
++                "second".to_owned(),
++                OverlayCommand::SetEnabled(true),
++            ),
++            Err(CursorArrivalError::QueueFull)
++        );
++        assert_eq!(
++            enqueue_cursor_command(None, "third".to_owned(), OverlayCommand::SetEnabled(true),),
++            Err(CursorArrivalError::QueueUnavailable)
++        );
+     }
+ 
+     #[test]
++    fn superseded_waiter_is_cancelled_without_erasing_the_new_waiter() {
++        let key = format!(
++            "cursor-arrival-test-{}",
++            NEXT_ARRIVAL_ID.fetch_add(1, Ordering::Relaxed)
++        );
++        let (old_tx, mut old_rx) = tokio::sync::oneshot::channel::<()>();
++        let old_id = arrival_register(key.clone(), old_tx);
++        let (new_tx, mut new_rx) = tokio::sync::oneshot::channel::<()>();
++        let new_id = arrival_register(key.clone(), new_tx);
++
++        assert!(matches!(
++            old_rx.try_recv(),
++            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
++        ));
++        arrival_cancel(&key, old_id);
++        assert!(matches!(
++            new_rx.try_recv(),
++            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
++        ));
++        arrival_fire(&key);
++        assert!(matches!(new_rx.try_recv(), Ok(())));
++        assert_ne!(old_id, new_id);
++    }
++
++    #[test]
+     fn per_key_arrival_isolation() {
+         // Two concurrent waiters keyed A and B; firing A must not cancel B.
+         // This mirrors the ARRIVAL_TX HashMap logic in isolation (no statics).
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
+@@ -818,6 +818,17 @@
+ /// regular `screenshot` tool for the Claude Code computer-use compat
+ /// variant — same name, stricter args, window-scoped JPEG @ 85% + a text
+ /// note telling the caller to use pixel-addressed tools.
++pub(crate) fn cursor_animation_refusal(
++    error: crate::cursor::overlay::CursorArrivalError,
++) -> cua_driver_core::protocol::ToolResult {
++    let message = format!("Cursor animation failed before input dispatch: {error}");
++    cua_driver_core::protocol::ToolResult::error(&message).with_structured(serde_json::json!({
++        "code": "cursor_animation_unavailable",
++        "effect": "refused",
++        "reason": error.to_string(),
++    }))
++}
++
+ pub fn register_all(
+     registry: &mut ToolRegistry,
+     compat: bool,
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
+@@ -295,7 +295,11 @@
+             }
+             // Glide the session's agent cursor to the screen point for visibility.
+             let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
+-            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), sx, sy).await;
++            if let Err(error) =
++                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), sx, sy).await
++            {
++                return super::cursor_animation_refusal(error);
++            }
+             self.state
+                 .cursor_registry
+                 .update_position(&cursor_key, sx, sy);
+@@ -483,7 +487,11 @@
+                     cursor_key.clone(),
+                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
+                 );
+-                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await;
++                if let Err(error) =
++                    crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await
++                {
++                    return super::cursor_animation_refusal(error);
++                }
+                 self.state
+                     .cursor_registry
+                     .update_position(&cursor_key, cx, cy);
+@@ -524,7 +532,11 @@
+                     cursor_key.clone(),
+                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
+                 );
+-                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await;
++                if let Err(error) =
++                    crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await
++                {
++                    return super::cursor_animation_refusal(error);
++                }
+                 // Keep the registry in sync with the overlay so
+                 // get_agent_cursor_state reports a truthful position even when
+                 // the click was dispatched via the AX path (no pixel coords).
+@@ -958,7 +970,12 @@
+             }
+             // Animate the visual cursor to the click point and wait for it to
+             // arrive — mirrors Swift's `AgentCursor.shared.animateAndWait(to:)`.
+-            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
++            if let Err(error) =
++                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y)
++                    .await
++            {
++                return super::cursor_animation_refusal(error);
++            }
+             // Keep the registry in sync with the overlay (see AX path above).
+             self.state
+                 .cursor_registry
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/double_click.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/double_click.rs
+@@ -235,7 +235,11 @@
+             );
+         }
+         // Animate cursor to the click point; wait for arrival before firing.
+-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
++        if let Err(error) =
++            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await
++        {
++            return super::cursor_animation_refusal(error);
++        }
+         crate::cursor::overlay::send_command(
+             cursor_key.clone(),
+             cursor_overlay::OverlayCommand::ClickPulse {
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/drag.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/drag.rs
+@@ -285,7 +285,11 @@
+                 cursor_overlay::OverlayCommand::PinAbove(wid as u64),
+             );
+         }
+-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), from_sx, from_sy).await;
++        if let Err(error) =
++            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), from_sx, from_sy).await
++        {
++            return super::cursor_animation_refusal(error);
++        }
+ 
+         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
+         // Drags can trigger drag-and-drop side-effects that spawn helper
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/move_cursor.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/move_cursor.rs
+@@ -94,7 +94,6 @@
+         };
+         let cursor_id = super::cursor_tools::resolve_cursor_key(&args);
+ 
+-        self.state.cursor_registry.update_position(&cursor_id, x, y);
+         // Drive the DRAWN cursor via the same path as click's animation. A raw
+         // `MoveTo` doesn't reliably bring a brand-new session cursor on-screen —
+         // it sits at the off-screen sentinel until a click seeds it, so the
+@@ -102,7 +101,11 @@
+         // overlay wouldn't). `animate_cursor_to` seeds the sentinel on-screen
+         // then glides in, identical to `click`. No-op for an empty (anonymous)
+         // key or when the overlay is disabled for this cursor.
+-        crate::cursor::overlay::animate_cursor_to(cursor_id.clone(), x, y).await;
++        if let Err(error) = crate::cursor::overlay::animate_cursor_to(cursor_id.clone(), x, y).await
++        {
++            return super::cursor_animation_refusal(error);
++        }
++        self.state.cursor_registry.update_position(&cursor_id, x, y);
+         ToolResult::text(format!(
+             "Agent cursor '{cursor_id}' moved to ({x:.1}, {y:.1})."
+         ))
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/right_click.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/right_click.rs
+@@ -229,7 +229,11 @@
+             );
+         }
+         // Animate cursor to the click point; wait for arrival before firing.
+-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
++        if let Err(error) =
++            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await
++        {
++            return super::cursor_animation_refusal(error);
++        }
+         crate::cursor::overlay::send_command(
+             cursor_key.clone(),
+             cursor_overlay::OverlayCommand::ClickPulse {
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/scroll.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/scroll.rs
+@@ -500,12 +500,15 @@
+                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
+                 );
+             }
+-            crate::cursor::overlay::animate_cursor_to(
++            if let Err(error) = crate::cursor::overlay::animate_cursor_to(
+                 cursor_key.clone(),
+                 target.screen_x,
+                 target.screen_y,
+             )
+-            .await;
++            .await
++            {
++                return super::cursor_animation_refusal(error);
++            }
+             self.state.cursor_registry.update_position(
+                 &cursor_key,
+                 target.screen_x,
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/set_value.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/set_value.rs
+@@ -176,7 +176,12 @@
+                 cursor_key.clone(),
+                 cursor_overlay::OverlayCommand::PinAbove(window_id as u64),
+             );
+-            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
++            if let Err(error) =
++                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y)
++                    .await
++            {
++                return super::cursor_animation_refusal(error);
++            }
+             self.state
+                 .cursor_registry
+                 .update_position(&cursor_key, screen_x, screen_y);
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/type_text.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/type_text.rs
+@@ -324,8 +324,15 @@
+                     cursor_key.clone(),
+                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
+                 );
+-                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y)
+-                    .await;
++                if let Err(error) = crate::cursor::overlay::animate_cursor_to(
++                    cursor_key.clone(),
++                    screen_x,
++                    screen_y,
++                )
++                .await
++                {
++                    return super::cursor_animation_refusal(error);
++                }
+                 self.state
+                     .cursor_registry
+                     .update_position(&cursor_key, screen_x, screen_y);
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/page.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/page.rs
+@@ -159,7 +159,11 @@
+             cursor_key.clone(),
+             cursor_overlay::OverlayCommand::PinAbove(window_id),
+         );
+-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
++        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y)
++            .await
++            .map_err(|error| {
++                anyhow::anyhow!("Cursor animation failed before page click dispatch: {error}")
++            })?;
+         self.state
+             .cursor_registry
+             .update_position(&cursor_key, screen_x, screen_y);
+--- a/libs/cua-driver/rust/crates/platform-macos/src/browser/platform.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/browser/platform.rs
+@@ -807,7 +807,17 @@
+             action.session.clone(),
+             cursor_overlay::OverlayCommand::PinAbove(action.window_id),
+         );
+-        crate::cursor::overlay::animate_cursor_to(action.session.clone(), screen_x, screen_y).await;
++        if let Err(error) =
++            crate::cursor::overlay::animate_cursor_to(action.session.clone(), screen_x, screen_y)
++                .await
++        {
++            tracing::warn!(
++                session = %action.session,
++                %error,
++                "browser cursor visualization did not arrive"
++            );
++            return;
++        }
+         self.cursor_registry
+             .update_position(&action.session, screen_x, screen_y);
+ 
