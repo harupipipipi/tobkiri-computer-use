@@ -7,6 +7,8 @@ dist
 artifacts
 .DS_Store
 *.log
+node_modules/
+/companion/test-results/
 .env
 .env.*
 !.env.example

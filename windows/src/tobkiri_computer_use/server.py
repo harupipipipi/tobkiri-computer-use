@@ -6,6 +6,7 @@ import base64
 from collections import OrderedDict
 from importlib.resources import files
 import json
+import os
 import sys
 import threading
 
@@ -223,7 +224,10 @@ class ToolService:
             if name == "tobkiri_windows":
                 return content({"windows": self.computer.windows(**args)})
             if name == "tobkiri_cursor" and args.get("action") == "status":
-                return content({"cursors": self.computer.cursor_status(pid=args["pid"], window_id=args["window_id"])})
+                result = {"cursors": self.computer.cursor_status(pid=args["pid"], window_id=args["window_id"])}
+                if self.computer._companion.enabled:
+                    result["companion"] = self.computer.companion_status()
+                return content(result)
             if name == "tobkiri_preview":
                 # Pure image operation: even an invalid target must not create
                 # a driver/cursor session or refresh the native snapshot.
@@ -364,16 +368,26 @@ def handle_rpc(service, message):
 
 
 def main():
+    # MCP is UTF-8 even on Japanese Windows, where Python pipes default to cp932.
+    for stream in (sys.stdin, sys.stdout):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--surface", choices=["all", "compact"], default="all",
                         help="all preserves every Cua tool; compact exposes 11 helpers plus the launcher's runtime tool with on-demand native discovery")
     parser.add_argument("--driver", help="Trusted startup executable; defaults to the configured runtime or cua-driver")
+    parser.add_argument("--companion-port", type=int, help="Enable a character renderer on this loopback UDP port")
     parser.add_argument("--socket", help="Explicit host driver socket; otherwise use Tobkiri's saved runtime")
     parser.add_argument("--cursor-coordinates", choices=["screen_points", "window_pixels"],
                         help="Override only after calibrating this driver's overlay contract")
     parser.add_argument("--approval", choices=["deny", "terminal", "windows-dialog"], default="deny",
                         help="Trusted host startup setting: per-action human prompt for foreground/desktop input. Default denies; no auto-approve mode.")
     args = parser.parse_args()
+    if args.companion_port is not None:
+        if not 1024 < args.companion_port < 65536:
+            parser.error("Companion port must be 1025..65535")
+        os.environ["TOBKIRI_COMPANION"] = "1"
+        os.environ["TOBKIRI_COMPANION_PORT"] = str(args.companion_port)
     from .runtime import driver_command
     command = driver_command(driver=args.driver, endpoint=args.socket)
     approval = {"deny": None, "terminal": TerminalConsent(), "windows-dialog": WindowsDialogConsent()}[args.approval]
