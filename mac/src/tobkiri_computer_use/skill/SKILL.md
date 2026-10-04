@@ -52,6 +52,15 @@ native window points are screenshot pixels.
    input or `effect="unverifiable"` is not proof of the requested outcome.
    Supply `expect` when a native bounded predicate can prove it.
 
+For a task that can be observed and verified through AX text, including use by
+a model without vision, pass `screenshot=false` to `tobkiri_observe` (Python:
+`window.observe(screenshot=False)`). Use the returned element IDs/handles for
+AX actions and inspect the returned text state; automatic readback retains
+that screenshot setting. Pixel input and Python `window.move()` still require
+a screenshot frame. AX `frame` values are native screen points, not screenshot
+pixels; do not fabricate screenshot points from them. Image-only controls and
+visual completion checks need an appropriate observation route.
+
 Use `action="set_value", text="..."` for native editable fields. For renderer
 inputs, prefer tab tools when available, or observed native AX/pixel input.
 When using `type_text`, verify actual content.
@@ -267,6 +276,11 @@ still returns a fresh observation per action. Helpers default to a fast virtual
 cursor; `window.set_cursor_speed("normal")` restores native motion. This is a
 per-session setting. Raw Cua callers keep their native defaults and can explicitly
 set `glide_duration_ms=1` (zero means normal speed, not instant).
+
+On the macOS native build with patch 0013, the exact fast profile described in
+the timed input reference teleports and does not wait for render arrival.
+Unpatched 0.28.2 retains its 1 ms animation; the version string alone does not
+identify support. Queued movement does not prove painted pixels or app effects.
 
 ```python
 left = computer.mouse("left", pid=PID_A, window_id=WINDOW_A)

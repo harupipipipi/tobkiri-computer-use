@@ -9,8 +9,9 @@ from .geometry import Frame
 from .transport import ComputerError
 
 
-# Cua 0.28.2: zero means speed-based motion, NOT instant. A positive 1 ms
-# glide completes on the next render tick; keep the overlay visible.
+# Cua 0.28.2: zero means speed-based motion, NOT instant. On the native 0013
+# build, this exact fast profile teleports without a render-arrival wait.
+# Unpatched builds retain the positive 1 ms glide and its render-tick wait.
 MOTION_PROFILES = {
     "fast": {"glide_duration_ms": 1.0, "dwell_after_click_ms": 0.0,
              "spring": 1.0, "arc_size": 0.0, "arc_flow": 0.0, "turn_radius": 1.0},

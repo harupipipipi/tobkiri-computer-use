@@ -1,0 +1,355 @@
+--- a/libs/cua-driver/rust/crates/platform-macos/src/cursor/overlay.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/cursor/overlay.rs
+@@ -80,6 +80,11 @@
+ static ARRIVAL_TX: Mutex<Option<HashMap<CursorKey, ArrivalWaiter>>> = Mutex::new(None);
+ static NEXT_ARRIVAL_ID: AtomicU64 = AtomicU64::new(1);
+ 
++// Accepted motion commands, keyed by their owner. A subsequent action must
++// see the requested policy even when the render thread has not drained it yet.
++// Only successful enqueues update this cache; removal/revival clears it.
++static REQUESTED_MOTION: Mutex<Option<HashMap<CursorKey, MotionConfig>>> = Mutex::new(None);
++
+ fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) -> u64 {
+     let id = NEXT_ARRIVAL_ID.fetch_add(1, Ordering::Relaxed);
+     let mut guard = ARRIVAL_TX.lock().unwrap();
+@@ -107,6 +112,22 @@
+                 let _ = waiter.tx.send(());
+             }
+         }
++    }
++}
++
++fn arrival_supersede(key: &CursorKey) {
++    if let Ok(mut guard) = ARRIVAL_TX.lock() {
++        if let Some(map) = guard.as_mut() {
++            // Dropping a waiter cancels it. Teleporting never fabricates an
++            // arrival for an older action that has not dispatched its input.
++            map.remove(key);
++        }
++    }
++}
++
++fn forget_requested_motion(key: &str) {
++    if let Some(map) = REQUESTED_MOTION.lock().unwrap().as_mut() {
++        map.remove(key);
+     }
+ }
+ 
+@@ -285,7 +306,61 @@
+ /// Send a keyed command from any thread (MCP tool, etc.).  Non-blocking; drops
+ /// if the channel is full (old commands are less important than new ones).
+ pub fn send_command(key: CursorKey, cmd: OverlayCommand) {
+-    let _ = enqueue_cursor_command(CMD_TX.get(), key, cmd);
++    let mut requested = REQUESTED_MOTION.lock().unwrap();
++    let _ = enqueue_with_motion(CMD_TX.get(), key, cmd, &mut requested);
++}
++
++fn enqueue_with_motion(
++    tx: Option<&std::sync::mpsc::SyncSender<OverlayMsg>>,
++    key: CursorKey,
++    cmd: OverlayCommand,
++    requested: &mut Option<HashMap<CursorKey, MotionConfig>>,
++) -> Result<(), CursorArrivalError> {
++    let motion = match &cmd {
++        OverlayCommand::SetMotion(motion) => Some(motion.clone()),
++        _ => None,
++    };
++    enqueue_cursor_command(tx, key.clone(), cmd)?;
++    if !key.is_empty() {
++        if let Some(motion) = motion {
++            requested
++                .get_or_insert_with(HashMap::new)
++                .insert(key, motion);
++        }
++    }
++    Ok(())
++}
++
++// This exact, already-public profile is Tobkiri's explicit fast policy.
++// Zero still selects Cua's normal speed-based animation. Other profiles keep
++// the existing bounded arrival path, including their dwell/spring settings.
++fn teleport_motion(motion: &MotionConfig) -> bool {
++    motion.glide_duration_ms == 1.0
++        && motion.dwell_after_click_ms == 0.0
++        && motion.spring == 1.0
++        && motion.arc_size == 0.0
++        && motion.arc_flow == 0.0
++        && motion.turn_radius == 1.0
++}
++
++fn enqueue_teleport(
++    tx: Option<&std::sync::mpsc::SyncSender<OverlayMsg>>,
++    key: &CursorKey,
++    motion: &MotionConfig,
++    x: f64,
++    y: f64,
++) -> Option<Result<(), CursorArrivalError>> {
++    if !teleport_motion(motion) {
++        return None;
++    }
++    // Reuse the existing SnapTo + tip-offset contract used by native drags.
++    // Acceptance wakes the renderer but never waits for a frame or arrival.
++    // Queue failures remain refusals before the caller's native input.
++    Some(enqueue_cursor_command(
++        tx,
++        key.clone(),
++        cursor_overlay::track_pointer_command(x, y),
++    ))
+ }
+ 
+ /// Convenience for callsites not yet threaded with a session key: drives the
+@@ -318,6 +393,7 @@
+     if key.is_empty() {
+         return;
+     }
++    forget_requested_motion(&key);
+     if let Some(tx) = CMD_TX.get() {
+         let _ = tx.try_send(OverlayMsg::Remove(key));
+     }
+@@ -329,6 +405,7 @@
+     if key.is_empty() {
+         return;
+     }
++    forget_requested_motion(&key);
+     if let Some(tx) = CMD_TX.get() {
+         let _ = tx.try_send(OverlayMsg::Revive(key));
+     }
+@@ -340,6 +417,15 @@
+ /// `"default"` cursor's motion when that key has no own entry yet (e.g. a
+ /// session whose first motion call precedes any move/enable).
+ pub fn current_motion(key: &str) -> MotionConfig {
++    if let Some(motion) = REQUESTED_MOTION
++        .lock()
++        .unwrap()
++        .as_ref()
++        .and_then(|map| map.get(key))
++        .cloned()
++    {
++        return motion;
++    }
+     let guard = RENDER.lock().unwrap();
+     let Some(map) = guard.as_ref() else {
+         return MotionConfig::default();
+@@ -439,9 +525,9 @@
+ /// Animate the overlay cursor to `(x, y)` and suspend until the Dubins path
+ /// completes and the spring overshoot begins.
+ ///
+-/// Mirrors Swift's `AgentCursor.shared.animateAndWait(to:)`.
+-/// Returns immediately (no animation) only when the overlay is disabled for
+-/// this cursor. A brand-new cursor still at the off-screen sentinel is first
++/// Tobkiri's fast profile queues an exact SnapTo and returns without waiting
++/// for the renderer. Other profiles mirror Swift's animateAndWait(to:).
++/// A brand-new animated cursor still at the off-screen sentinel is first
+ /// seeded on-screen via [`seed_start_if_sentinel`] so its FIRST action glides
+ /// in (it previously snapped silently via `ClickPulse`, invisible on a pure-AX
+ /// run).
+@@ -449,6 +535,12 @@
+     // Empty key is the explicit no-cursor sentinel → nothing to animate.
+     if key.is_empty() {
+         return Ok(());
++    }
++    if let Some(result) = enqueue_teleport(CMD_TX.get(), &key, &current_motion(&key), x, y) {
++        if result.is_ok() {
++            arrival_supersede(&key);
++        }
++        return result;
+     }
+     // Seed a sentinel cursor on-screen so the MoveTo below glides instead of
+     // being short-circuited. After this the cursor's pos.0 > -50.0, so the
+@@ -1684,6 +1776,196 @@
+         assert_ne!(old_id, new_id);
+     }
+ 
++    fn teleport_profile() -> MotionConfig {
++        MotionConfig {
++            glide_duration_ms: 1.0,
++            dwell_after_click_ms: 0.0,
++            spring: 1.0,
++            arc_size: 0.0,
++            arc_flow: 0.0,
++            turn_radius: 1.0,
++            ..MotionConfig::default()
++        }
++    }
++
++    #[test]
++    fn teleport_profile_leaves_zero_and_other_animation_profiles_alone() {
++        assert!(!teleport_motion(&MotionConfig::default()));
++        assert!(teleport_motion(&teleport_profile()));
++        for (glide, dwell, spring) in [
++            (0.0, 0.0, 1.0),
++            (2.0, 0.0, 1.0),
++            (1.0, 80.0, 1.0),
++            (1.0, 0.0, 0.72),
++        ] {
++            let motion = MotionConfig {
++                glide_duration_ms: glide,
++                dwell_after_click_ms: dwell,
++                spring,
++                ..teleport_profile()
++            };
++            assert!(!teleport_motion(&motion));
++        }
++    }
++
++    #[test]
++    fn teleport_enqueue_returns_before_any_render_tick() {
++        let (tx, rx) = std::sync::mpsc::sync_channel::<OverlayMsg>(1);
++        let key = "teleport-without-renderer".to_owned();
++        // The receiver has not consumed anything and no render thread exists.
++        assert_eq!(
++            enqueue_teleport(Some(&tx), &key, &teleport_profile(), -710.0, 160.0),
++            Some(Ok(()))
++        );
++        let command = rx.try_recv().unwrap();
++        let OverlayMsg::Cmd(KeyedOverlayCommand {
++            key: queued_key,
++            cmd,
++        }) = command
++        else {
++            panic!("expected command")
++        };
++        assert_eq!(queued_key, key);
++        assert!(matches!(cmd, OverlayCommand::SnapTo { .. }));
++        assert!(matches!(
++            rx.try_recv(),
++            Err(std::sync::mpsc::TryRecvError::Empty)
++        ));
++    }
++
++    #[test]
++    fn teleport_queue_errors_refuse_without_retrying_or_claiming_arrival() {
++        let key = "teleport-queue-errors".to_owned();
++        let fast = teleport_profile();
++        assert_eq!(
++            enqueue_teleport(None, &key, &fast, 1.0, 2.0),
++            Some(Err(CursorArrivalError::QueueUnavailable))
++        );
++        let (tx, rx) = std::sync::mpsc::sync_channel::<OverlayMsg>(1);
++        assert_eq!(
++            enqueue_teleport(Some(&tx), &key, &fast, 1.0, 2.0),
++            Some(Ok(()))
++        );
++        assert_eq!(
++            enqueue_teleport(Some(&tx), &key, &fast, 3.0, 4.0),
++            Some(Err(CursorArrivalError::QueueFull))
++        );
++        drop(rx);
++        assert_eq!(
++            enqueue_teleport(Some(&tx), &key, &fast, 5.0, 6.0),
++            Some(Err(CursorArrivalError::QueueDisconnected))
++        );
++    }
++
++    #[test]
++    fn teleport_tip_coordinates_and_repeated_points_need_no_path_or_spring() {
++        let mut state = RenderState::new(CursorConfig::default());
++        for (x, y) in [(100.0, 200.0), (-1234.0, 650.0), (-1234.0, 650.0)] {
++            state.apply_command(cursor_overlay::track_pointer_command(x, y));
++            let offset = 16.0 * std::f64::consts::FRAC_PI_4.cos();
++            assert!((state.core.pos.0 - offset - x).abs() < 1e-9);
++            assert!((state.core.pos.1 - offset - y).abs() < 1e-9);
++            assert!(state.core.path.is_none());
++            assert!(state.core.spring.is_none());
++            assert_eq!(state.core.idle_alpha, 1.0);
++        }
++    }
++
++    #[test]
++    fn teleport_replaces_one_cursors_curve_without_touching_another_or_reviving_ended_keys() {
++        let mut map = empty_map();
++        apply_msg(&mut map, move_msg("teleport-a", 100.0, 200.0));
++        apply_msg(&mut map, move_msg("teleport-b", 300.0, 400.0));
++        let other = map.cursors["teleport-b"].core.pos;
++        apply_msg(
++            &mut map,
++            OverlayMsg::Cmd(KeyedOverlayCommand {
++                key: "teleport-a".to_owned(),
++                cmd: cursor_overlay::track_pointer_command(500.0, 600.0),
++            }),
++        );
++        assert!(map.cursors["teleport-a"].core.path.is_none());
++        assert!(map.cursors["teleport-a"].core.spring.is_none());
++        assert_eq!(map.cursors["teleport-b"].core.pos, other);
++        assert!(map.cursors["teleport-b"].core.path.is_some());
++        apply_msg(&mut map, OverlayMsg::Remove("teleport-a".to_owned()));
++        apply_msg(
++            &mut map,
++            OverlayMsg::Cmd(KeyedOverlayCommand {
++                key: "teleport-a".to_owned(),
++                cmd: cursor_overlay::track_pointer_command(1.0, 2.0),
++            }),
++        );
++        assert!(!map.cursors.contains_key("teleport-a"));
++    }
++
++    #[test]
++    fn teleport_policy_is_available_before_render_and_failed_motion_updates_do_not_change_it() {
++        let (tx, rx) = std::sync::mpsc::sync_channel::<OverlayMsg>(1);
++        let key = "teleport-requested-policy".to_owned();
++        let mut requested = None;
++        assert_eq!(
++            enqueue_with_motion(
++                Some(&tx),
++                key.clone(),
++                OverlayCommand::SetMotion(teleport_profile()),
++                &mut requested
++            ),
++            Ok(())
++        );
++        let motion = requested.as_ref().unwrap().get(&key).unwrap();
++        assert!(teleport_motion(motion));
++        assert_eq!(
++            enqueue_with_motion(
++                Some(&tx),
++                key.clone(),
++                OverlayCommand::SetMotion(MotionConfig::default()),
++                &mut requested
++            ),
++            Err(CursorArrivalError::QueueFull)
++        );
++        assert!(teleport_motion(
++            requested.as_ref().unwrap().get(&key).unwrap()
++        ));
++        rx.try_recv().unwrap();
++        assert_eq!(
++            enqueue_with_motion(
++                Some(&tx),
++                "other-owner".to_owned(),
++                OverlayCommand::SetMotion(MotionConfig::default()),
++                &mut requested
++            ),
++            Ok(())
++        );
++        assert!(teleport_motion(
++            requested.as_ref().unwrap().get(&key).unwrap()
++        ));
++        assert!(!teleport_motion(
++            &requested.as_ref().unwrap()["other-owner"]
++        ));
++    }
++
++    #[test]
++    fn teleport_supersedes_only_its_own_waiter_without_false_success() {
++        let id = NEXT_ARRIVAL_ID.fetch_add(1, Ordering::Relaxed);
++        let a = format!("teleport-waiter-a-{id}");
++        let b = format!("teleport-waiter-b-{id}");
++        let (txa, mut rxa) = tokio::sync::oneshot::channel::<()>();
++        let (txb, mut rxb) = tokio::sync::oneshot::channel::<()>();
++        arrival_register(a.clone(), txa);
++        let other_id = arrival_register(b.clone(), txb);
++        arrival_supersede(&a);
++        assert!(matches!(
++            rxa.try_recv(),
++            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
++        ));
++        assert!(matches!(
++            rxb.try_recv(),
++            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
++        ));
++        arrival_cancel(&b, other_id);
++    }
++
+     #[test]
+     fn per_key_arrival_isolation() {
+         // Two concurrent waiters keyed A and B; firing A must not cancel B.
