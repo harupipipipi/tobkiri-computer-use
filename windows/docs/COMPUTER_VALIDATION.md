@@ -50,3 +50,26 @@ optional Cua exact-tab tools keep their existing schemas and contracts.
 Hardware/focus actions still require one-action consent. See
 [WINDOWS_PARITY.md](WINDOWS_PARITY.md) and
 [Cursor Studio validation](../../companion/TESTING.md) for earlier scoped evidence.
+
+## Visible replay
+
+The default acceptance run closes its disposable windows. To watch a slower
+replay and leave the result open, use:
+
+```powershell
+.venv\Scripts\python.exe scripts/live_acceptance_windows.py --driver C:\path\to\cua-driver.exe --output artifacts/visible-replay.json --visible-demo --keep-open --step-delay 5
+```
+
+This explicitly displays one disposable target, waits 15 seconds, and confirms
+Increment, text insertion, Apply and UIA scroll, pausing between actions. It uses
+background input only, never approves a hardware fallback, and does not probe
+physical pointer movement. Close the fixture normally when finished. Its log
+directory remains under ignored `artifacts/` so the retained window can continue
+to write events. The ordinary background acceptance also skips the physical
+pointer probe unless `--allow-foreground` was explicitly requested.
+
+The visible replay on 2026-10-08 confirmed all four actions: Count 1, Name/Applied
+`Hello from Tobkiri`, and rows 21–28. Fresh screenshots and fixture events agree;
+the target process remained open in the user's interactive Windows session.
+The user also confirmed seeing it. This adds visible-fixture evidence, not
+universal application compatibility. Logs are UTF-8 on Japanese Windows.

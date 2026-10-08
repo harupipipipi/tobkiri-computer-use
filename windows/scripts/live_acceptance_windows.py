@@ -12,6 +12,7 @@ import tempfile
 import time
 
 from tobkiri_computer_use import Computer, ComputerError, ConsentDecision
+from tobkiri_computer_use.runtime import driver_command
 from tobkiri_computer_use.transport import structured
 
 
@@ -135,19 +136,114 @@ def allow_acceptance_foreground(request):
     return ConsentDecision(request.id, request.digest, True)
 
 
+def visible_demo(args, fixture):
+    """User-requested visible replay; background inputs and a persistent fixture."""
+    directory = Path(tempfile.mkdtemp(prefix="visible-demo-", dir=args.output.parent))
+    ready, events = directory / "ready.json", directory / "events.jsonl"
+    process = subprocess.Popen([
+        str(fixture), "--mode", "target", "--ready-file", str(ready),
+        "--event-log", str(events),
+    ], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    report = {"mode": "visible-demo", "steps": [], "passed": False,
+              "physical_input_requested": False, "artifact_directory": str(directory)}
+    try:
+        target = wait_file(ready)
+        with Computer(command=driver_command(driver=args.driver), companion=True,
+                      approval_callback=None) as computer:
+            row = wait_window(computer, target["pid"], "Tobkiri Windows Target")
+            window = computer.window(pid=row["pid"], window_id=row["window_id"])
+            # The visible-demo flag requests presentation of this exact disposable
+            # fixture. It does not approve any foreground/hardware input action.
+            if not force_fixture_foreground(row["window_id"]):
+                raise RuntimeError("The disposable fixture could not be shown in front.")
+            report.update(pid=row["pid"], window_id=row["window_id"], title=row["title"])
+            state = window.observe()
+            state.save(args.output.with_name(args.output.stem + "-before.png"))
+            report["observed_elements"] = [element.to_dict() for element in state.elements[:8]]
+            args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            print(f"VISIBLE {row['title']} - starting in 15 seconds", flush=True)
+            time.sleep(15)
+
+            def record(label, result, confirmed):
+                if not confirmed:
+                    raise RuntimeError(f"{label}: fresh fixture state did not confirm the effect; no retry.")
+                report["steps"].append({"action": label, "confirmed": True,
+                                        "delivery": result.delivery})
+                print(f"CONFIRMED {label}", flush=True)
+                time.sleep(args.step_delay)
+
+            state = window.observe()
+            clicked = window.click(first_label(state, "Increment"))
+            record("Increment: Count 1", clicked,
+                   wait_event(events, "increment", lambda event: event.get("count") == 1) is not None)
+
+            state = window.observe()
+            typed = window.type_text(first_label(state, "Name"), "Hello from Tobkiri")
+            name = first_label(typed.observation, "Name")
+            record("Name: Hello from Tobkiri", typed, name.value == "Hello from Tobkiri")
+
+            state = window.observe()
+            applied = window.click(first_label(state, "Apply"))
+            record("Apply: Hello from Tobkiri", applied,
+                   wait_event(events, "apply", lambda event: event.get("value") == "Hello from Tobkiri") is not None)
+
+            state = window.observe()
+            before_rows = visible_rows(state)
+            scrolled = window.scroll(first_label(state, "Scrollable list"), "down", amount=3)
+            after_rows = visible_rows(scrolled.observation)
+            record("UIA scroll", scrolled, before_rows != after_rows)
+            report["visible_rows"] = after_rows
+            report["companion"] = computer.companion_status()
+            window.observe().save(args.output.with_name(args.output.stem + "-after.png"))
+            report["passed"] = True
+    except BaseException as error:
+        report["error"] = error.as_dict() if isinstance(error, ComputerError) else str(error)
+        raise
+    finally:
+        report["events"] = read_events(events)
+        report["window_kept_open"] = args.keep_open and process.poll() is None
+        if not args.keep_open and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+
+
 def main():
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser()
     parser.add_argument("--driver", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--allow-foreground", action="store_true",
                         help="Approve the test fixture's one-action foreground scroll/drag fallbacks")
+    parser.add_argument("--visible-demo", action="store_true",
+                        help="Show only the disposable target and replay background input slowly")
+    parser.add_argument("--keep-open", action="store_true",
+                        help="Leave the visible-demo fixture open for the user to inspect and close")
+    parser.add_argument("--step-delay", type=float, default=4,
+                        help="Visible-demo pause after each confirmed action (0..30 seconds)")
     args = parser.parse_args()
+    if args.keep_open and not args.visible_demo:
+        parser.error("--keep-open requires --visible-demo")
+    if not 0 <= args.step_delay <= 30:
+        parser.error("--step-delay must be between 0 and 30 seconds")
     root = Path(__file__).resolve().parents[1]
     fixture = root / "artifacts" / "TobkiriWindowsFixture.exe"
     if not fixture.exists():
         subprocess.run([sys.executable, str(root / "scripts" / "build_fixture_windows.py"),
                         "--output", str(fixture)], check=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.visible_demo:
+        if args.allow_foreground:
+            parser.error("--visible-demo uses background input only; omit --allow-foreground")
+        visible_demo(args, fixture)
+        return
     report = {
         "platform": "windows", "driver": args.driver,
         "environment": {"foreground_pointer_available": None},
@@ -182,7 +278,10 @@ def main():
                 witness_row = wait_window(computer, witness["pid"], "Tobkiri Windows Witness")
                 window = computer.window(pid=target_row["pid"], window_id=target_row["window_id"])
                 force_fixture_foreground(witness_row["window_id"])
-                pointer_available = foreground_pointer_available()
+                # Probing moves the physical pointer. A background-only run
+                # must not perform that hardware action during test setup.
+                pointer_available = (foreground_pointer_available()
+                                     if args.allow_foreground else None)
                 report["environment"]["foreground_pointer_available"] = pointer_available
                 before_foreground = foreground_window()
                 before_cursor = cursor_position()
