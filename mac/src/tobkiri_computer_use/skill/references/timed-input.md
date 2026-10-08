@@ -72,3 +72,12 @@ speed-based motion; it is not instant. Configuration is queued to the render
 thread, so an immediate state read can still show old values. Helpers handle
 the session setting and keep a fast pre-move for Cua's pixel-to-AX shortcut,
 which otherwise can return without updating the visual cursor.
+
+On the macOS native build carrying patch 0013, that exact six-setting fast
+profile selects teleport: native input no longer waits for cursor animation
+or a render tick. The SnapTo command keeps the same cursor-tip coordinates.
+An unavailable/full/disconnected overlay queue still refuses before input.
+Other motion profiles retain their normal animation. Unpatched 0.28.2 builds
+keep the 1 ms glide; the version number alone does not prove teleport support.
+Immediate render-state reads or screenshots may precede the queued snap;
+queue acceptance never establishes painted-pixel or application success.
