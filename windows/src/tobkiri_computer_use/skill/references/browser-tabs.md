@@ -1,5 +1,16 @@
 ## Native windows and browser tabs
 
+The combined MCP also provides `tobkiri_tabs_*` via the Browser Use MV3 extension.
+Start with `tobkiri_tabs_status`; use only that session's returned integer `tabId`
+and `workspaceId`. These are distinct from Cua `target_id`/`tab_id`/`browser_id`.
+The extension can operate explicitly granted inactive tabs without OS input.
+`inputRoute: "trusted"` dispatches CDP once; explicit `"dom"` uses synthetic DOM
+click/type/press/check once. Reobserve uncertain input before any different route.
+`tobkiri_tabs_eval` evaluates in the granted page's main world; host confirmation
+rules still apply to consequential effects. The shared Studio cursor is rendered
+in CSS viewport pixels inside that tab, never projected onto the front page.
+Extension refusal/offline state does not disable the native window ladder below.
+
 Keep Cua's normal ladder: observe the requested window, use a fresh AX element,
 then screenshot coordinates if AX is incomplete. A browser is still a native
 window: `tobkiri_observe` and `tobkiri_act` work on the page currently displayed

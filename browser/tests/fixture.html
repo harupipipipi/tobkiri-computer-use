@@ -1,0 +1,16 @@
+<!doctype html><meta charset="utf-8"><title>AI background workspace</title>
+<style>body{margin:0;background:#e9f4f4;color:#12323e;font:18px/1.6 sans-serif}main{max-width:760px;margin:auto;padding:48px}h1{font-size:42px;letter-spacing:-1.5px;line-height:1.12}p{color:#47616a}input,select,button{font:inherit;padding:10px;border:1px solid #8faeb5;border-radius:8px}button{background:#183947;color:white;cursor:pointer}label{display:block;margin:18px 0}.row{display:flex;gap:10px}#count{font-size:26px;font-weight:bold}#canvas{width:400px;height:110px;background:#fff;border:2px dashed #6b99a8;touch-action:none}.spacer{height:1100px}.small{font-size:12px}</style>
+<main><p class="small">TOBKIRI TABS · REAL BROWSER INTEGRATION TEST</p><h1>AI works here.<br>You keep the front tab.</h1><p>This tab is being operated in the background via the installed extension and MCP stdio.</p>
+<label>Task title <input id="entry" placeholder="Type a task" value="old value"></label><div class="row"><button id="increment">Background click</button><span id="count">0</span></div><p id="echo">No input yet</p>
+<label><input id="check" type="checkbox"> Keep human focus</label><label>Mode <select id="mode"><option value="default">Default</option><option value="background">Background</option></select></label>
+<label>Secret <input id="secret" type="password" value="NOT-FOR-SNAPSHOT"></label><div id="shadow-host"></div><div id="canvas">Drag inside this area</div><p id="drag-count">0</p>
+<form id="form"><input id="submit-entry" placeholder="Press Enter"><button>Submit locally</button></form><p id="submitted">Not submitted</p>
+<div class="spacer"></div><button id="bottom">Bottom button</button><p id="bottom-status">Not clicked</p></main>
+<script>
+window.eventLog=[];let n=0;increment.addEventListener('click',e=>{count.textContent=++n;eventLog.push({kind:'click',trusted:e.isTrusted});});entry.addEventListener('input',e=>{echo.textContent=entry.value;eventLog.push({kind:'input',trusted:e.isTrusted});});
+check.addEventListener('click',e=>eventLog.push({kind:'check',trusted:e.isTrusted}));
+document.getElementById('bottom').onclick=()=>document.getElementById('bottom-status').textContent='Clicked at bottom';
+const shadow=document.getElementById('shadow-host').attachShadow({mode:'open'});shadow.innerHTML='<button id="shadow-button">Shadow click</button>';shadow.querySelector('button').onclick=()=>echo.textContent='Shadow clicked';
+let down=false,moves=0;canvas.onmousedown=()=>{down=true;};canvas.onmousemove=()=>{if(down)document.getElementById('drag-count').textContent=++moves;};canvas.onmouseup=()=>down=false;
+form.onsubmit=e=>{e.preventDefault();submitted.textContent='Submitted locally';};
+</script>

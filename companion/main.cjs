@@ -20,6 +20,19 @@ let studio,
   enabled = false,
   quitting = false;
 let tray;
+let sharedPackFile = process.env.TOBKIRI_CURSOR_PACK;
+async function publishPack() {
+  if (!sharedPackFile || !config) return;
+  // Presentation only. Publishing failures never grant permission or send input.
+  try {
+    await fs.mkdir(path.dirname(sharedPackFile), { recursive: true });
+    const temp = sharedPackFile + '.tmp';
+    await fs.writeFile(temp, JSON.stringify(config), { mode: 0o600 });
+    await fs.rename(temp, sharedPackFile);
+  } catch (error) {
+    console.error('Shared cursor pack: ' + error.code);
+  }
+}
 const overlays = new Map(),
   sessions = new Map();
 const arrivals = new Map();
@@ -143,7 +156,10 @@ else {
   app.on("second-instance", (_event, argv) => {
     if (argv.includes("--agent-mode")) {
       agentMode = true;
+      const packIndex = argv.indexOf('--cursor-pack');
+      if (packIndex >= 0 && argv[packIndex + 1]) sharedPackFile = argv[packIndex + 1];
       if (config) config.mode = "computer";
+      void publishPack();
       setEnabled(true);
     } else studio?.show();
   });
@@ -164,6 +180,7 @@ else {
             "保存した設定を読み込めませんでした。標準設定で起動しました。";
       }
       if (agentMode) config.mode = "computer";
+      await publishPack();
       Menu.setApplicationMenu(null);
       const area = screen.getPrimaryDisplay().workAreaSize;
       studio = new BrowserWindow({
@@ -224,6 +241,7 @@ else {
         await fs.writeFile(temp, JSON.stringify(next));
         await fs.rename(temp, configFile);
         config = next;
+        await publishPack();
         fanout("config", state());
         return state();
       });

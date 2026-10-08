@@ -9,6 +9,7 @@ artifacts
 *.log
 node_modules/
 /companion/test-results/
+/browser/extension/character-runtime.mjs
 .env
 .env.*
 !.env.example

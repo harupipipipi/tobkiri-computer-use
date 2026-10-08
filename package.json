@@ -1,0 +1,16 @@
+{
+  "name": "tobkiri-use",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.12" },
+  "scripts": {
+    "setup": "node integration/setup.mjs",
+    "sync:cursor": "node integration/sync-cursor.mjs",
+    "check:cursor": "node integration/sync-cursor.mjs --check",
+    "test": "node integration/sync-cursor.mjs && node --test integration/tests/*.test.mjs && npm --prefix browser test && npm --prefix companion test",
+    "test:browser": "node integration/sync-cursor.mjs && node integration/tests/cursor-dom.mjs && node integration/tests/browser-live.mjs",
+    "test:native": "node integration/sync-cursor.mjs && node integration/tests/native-smoke.mjs",
+    "mcp": "node integration/cli.mjs"
+  }
+}

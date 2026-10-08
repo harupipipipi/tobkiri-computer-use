@@ -12,6 +12,8 @@ Cua Driverを基盤に、PythonとMCPからアプリを操作するComputer Use�
 - [Cursor Studio](companion/README.md)：48種類のしぐさで操作についてくるキャラクター。
   棒人間の見た目、手描きカーソル、自作PNGアニメーションを編集できます。
   「petだけ」と「カーソル＋pet」を切り替えられます。
+- [Computer + Browser の統合起動](integration/README.md)：Browser UseのPR #1を基に、
+  許可された背景タブのDOM/CDP操作を同じMCPへ追加。Studioのキャラクターとカーソル設定を共有します。
 
 通常の仮想入力は追加確認なしで進め、物理マウス・キーボードや前面フォーカスを
 借りる操作は承認を通します。ログインや重要な操作はホスト側の確認ルールに従います。
@@ -53,6 +55,8 @@ windows/
   scripts/                  WinForms fixture と実機受け入れ試験
   tests/                    単体テスト
   docs/                     Windows比較・隔離実験
+browser/                    PR #1由来のMV3拡張・Browser MCP
+integration/                統合stdio MCP・共有カーソル・通し試験
 ```
 
 ## 検証状況

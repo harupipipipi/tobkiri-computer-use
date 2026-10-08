@@ -1,0 +1,6 @@
+{
+  "name": "tobkiri-tabs", "version": "0.3.0", "private": true,
+  "description": "Focus-preserving browser-tab automation: a local MCP server and Chrome MV3 extension.",
+  "type": "module", "license": "MIT", "engines": {"node": ">=22"},
+  "scripts": {"pretest":"node ../integration/sync-cursor.mjs", "setup": "node ../integration/sync-cursor.mjs && node src/cli.mjs setup", "start": "node src/cli.mjs bridge", "mcp": "node src/cli.mjs mcp", "doctor": "node src/cli.mjs doctor", "stop": "node src/cli.mjs stop", "test": "node --test tests/*.test.mjs"}
+}
