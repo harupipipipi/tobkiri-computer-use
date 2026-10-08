@@ -244,7 +244,8 @@ async function expectInput(tabId,ctx,types,counts={}) {
       if(!/context|navigat|frame|document/i.test(e.message))throw e;
       throw new AppError('INPUT_OUTCOME_UNKNOWN','Page context changed before delivery could be verified. The input may have applied; inspect the current page before retrying.');
     }
-    if(!types.some(t=>probe?.seen?.[t])||Object.entries(counts).some(([type,count])=>(probe?.seen?.[type]||0)<count))throw new AppError('INPUT_NOT_APPLIED','Required input events were not observed in the page (some hosts drop or defer input on hidden tabs). Do not assume the action applied; verify page state before retrying. The grant is intact.');
+    if(!types.some(t=>probe?.seen?.[t]))throw new AppError('INPUT_NOT_APPLIED','Required input events were not observed in the page (some hosts drop or defer input on hidden tabs). Do not assume the action applied; verify page state before retrying. The grant is intact.');
+    if(Object.entries(counts).some(([type,count])=>(probe?.seen?.[type]||0)<count))throw new AppError('INPUT_OUTCOME_UNKNOWN','Only part of the input gesture was observed. It may have affected the page or browser UI; inspect the current state before retrying. Input was not replayed.');
   };
 }
 // DOM delivery is an explicit choice, never a retry inferred from missing events.
@@ -261,10 +262,10 @@ async function click(tabId,p,a,ctx) {
   }
   const button=a.button||'left',buttons={left:1,right:2,middle:4}[button];
   const clickEvent=button==='right'?'contextmenu':button==='middle'?'auxclick':'click';
-  const verify=await expectInput(tabId,ctx,[clickEvent],{[clickEvent]:a.clickCount||1});
+  const count=a.clickCount||1;
+  const verify=await expectInput(tabId,ctx,['mousedown','mouseup',clickEvent],{mousedown:count,mouseup:count,[clickEvent]:count});
   await page(tabId,'cursor',{action:'move',...p},ctx);
   await raw(tabId,'Input.dispatchMouseEvent',{type:'mouseMoved',...p,button:'none'},ctx);
-  const count=a.clickCount||1;
   for(let n=1;n<=count;n++){
     await page(tabId,'cursor',{action:'down',...p},ctx);
     await raw(tabId,'Input.dispatchMouseEvent',{type:'mousePressed',...p,button,buttons,clickCount:n},ctx);
@@ -290,7 +291,7 @@ async function press(tabId,key,ctx,inputRoute) {
     const r=await domInput(tabId,'domKey',{key:last,code:params.code,modifiers,text},ctx);
     return {trusted:false,via:'dom-key',inserted:r.inserted,submitted:r.submitted};
   }
-  const verify=await expectInput(tabId,ctx,['keydown','keypress','keyup','beforeinput','input']);
+  const verify=await expectInput(tabId,ctx,['keydown','keypress','keyup','beforeinput','input'],{keydown:1,keyup:1});
   await raw(tabId,'Input.dispatchKeyEvent',{...params,type:text?'keyDown':'rawKeyDown',...(text?{text,unmodifiedText:text}:{})},ctx);
   try{await raw(tabId,'Input.dispatchKeyEvent',{...params,type:'keyUp'},ctx);}catch(e){await detach(tabId);throw e;}
   await verify();return {};
@@ -364,7 +365,7 @@ async function dispatch(name,a,ctx) {
       await domInput(a.tabId,'domType',{...a,text:a.text},ctx);
       return {inserted:true,characters:a.text.length,trusted:false,via:'dom-type'};
     }
-    const verify=await expectInput(a.tabId,ctx,['input','textInput']);
+    const verify=await expectInput(a.tabId,ctx,['beforeinput','input','textInput'],{input:1});
     if(a.text)await raw(a.tabId,'Input.insertText',{text:a.text},ctx);
     else await press(a.tabId,'Backspace',ctx);
     await verify();return {inserted:true,characters:a.text.length};

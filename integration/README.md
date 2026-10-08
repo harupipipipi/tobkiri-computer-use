@@ -68,8 +68,23 @@ DOM clickは一回の左クリックに対応します。CSS hover、ネイテ�
 pixel scroll/background dragはCua 0.28.2が対応せず、明示的な前面配送と一操作承認が必要です。
 最小化、別Windows仮想デスクトップ、任意のアプリへの配送は保証しません。
 
-通しブラウザ試験のネイティブ側はモックで、実機Windows試験は別途実行しています。
-通常Chrome/Edge、実際のユーザープロファイル、外部サイト、macOSの統合実機試験は未実施です。
+追加で通常版Chrome **154.0.8037.98** とEdge **154.0.4258.62** の専用ヘッドレス
+プロファイルを使い、それぞれ17項目を確認しました。こちらは実Cuaの95ツール/Skillと
+非表示の実Electron Studioを同じ試験に接続し、保存IPCから背景タブへの設定反映を検証しています。
+ネイティブ側はスキーマ/Skillだけを読み、デスクトップ入力は拒否する設定です。
+背景drag、ダブルクリック/右クリック、Unicodeのcontenteditable置換/削除、
+Shadow DOMのref、古いrefの拒否、背景navigationも確認しました。両ブラウザともタブ前面化は0件です。
+
+17項目には入力の拒否を検証する項目も含みます。両ブラウザの中クリックはtrustedの
+mousedown/mouseupだけ届き、auxclickを確認できませんでした。部分配送は
+`INPUT_OUTCOME_UNKNOWN` を返します。ブラウザ側の効果があり得るため、再送前に状態を確認してください。
+キーもkeydownとkeyupの両方を、文字入力も実際のinputイベントを必要とします。
+
+Chrome/Edge試験の拡張導入は、専用プロファイル限定のCDP `Extensions.loadUnpacked` を使います。
+通常版Chromeは[Chrome 137以降、`--load-extension`を廃止](https://groups.google.com/a/chromium.org/g/chromium-extensions/c/1-g8EFx2BBY/m/S0ET5wPjCAAJ)
+しているため、実利用は上記の拡張管理画面から読み込みます。試験用の導入フラグはMCP起動設定には加えません。
+
+画面に表示したChrome/Edge、実際のユーザープロファイル、外部サイト、macOSの統合実機試験は未実施です。
 macOS用pytestをWindowsで実行した結果はOS固有処理等で失敗しており、macOS検証には使いません。
 
 ## 検証コマンド
@@ -77,6 +92,7 @@ macOS用pytestをWindowsで実行した結果はOS固有処理等で失敗して
 ```powershell
 npm test
 npm run test:browser
+npm run test:browser:installed
 npm run test:native
 npm run test:studio
 cd windows
@@ -86,6 +102,11 @@ cd windows
 `npm test` はGUIへ入力しません。`test:browser` は捨てる専用プロファイルと架空ページだけを
 ヘッドレスで使い、任意のユーザー窓を操作しません。Playwrightは `companion` の開発依存です。
 Chromiumが未導入なら `npm exec --prefix companion -- playwright install chromium` で用意します。
+`test:browser:installed` は導入済みChrome/Edge、ネイティブPython環境、Electronが必要です。
+通常版ブラウザの使い捨てヘッドレスプロファイルだけで拡張を読み込み、基本のtrusted入力は
+成功を必須にします。報告の `refusedInput` は配送成功と区別します。個別実行は
+`node integration/tests/browser-live.mjs --browser chrome --native --studio --extended --require-trusted`
+（Edgeは `--browser msedge`）です。
 画像・生レポートは `integration/artifacts/` に保存し、Gitには含めません。
 通常のGUI実機試験はOS別READMEの既存の専用fixture用スクリプトだけを使います。
 `test:native` は実際のCuaへ接続してスキーマとSkillだけを読み、デスクトップ入力を行いません。

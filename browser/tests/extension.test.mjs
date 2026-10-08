@@ -190,21 +190,25 @@ test('extension permission and dispatch integration (MOCK native Chrome APIs)',a
     assert.ok((await tool('browser_tabs')).tabs.some(t=>t.tabId===w.tabId&&!t.revoked),'grant survives failed DOM fallback');
   }finally{fake.flags.dropInput=false;fake.flags.domFails=false;}
  });
- await t.test('partial gestures and lost page contexts never become successful clicks/types/drags',async()=>{
+ await t.test('partial clicks/types/keys/drags and lost contexts return unknown outcomes without replay',async()=>{
   const start=fake.cdpCalls.length;
   try{
    fake.flags.seenOverride={mousedown:1};
-   await assert.rejects(tool('browser_click',{tabId:w.tabId,selector:'button'}),/INPUT_NOT_APPLIED/);
-   await assert.rejects(tool('browser_drag',{tabId:w.tabId,points:[{x:1,y:1},{x:20,y:20}],durationMs:0}),/INPUT_NOT_APPLIED/);
+   await assert.rejects(tool('browser_click',{tabId:w.tabId,selector:'button'}),/INPUT_OUTCOME_UNKNOWN/);
+   await assert.rejects(tool('browser_drag',{tabId:w.tabId,points:[{x:1,y:1},{x:20,y:20}],durationMs:0}),/INPUT_OUTCOME_UNKNOWN/);
+   fake.flags.seenOverride={mousedown:1,mouseup:1};
+   await assert.rejects(tool('browser_click',{tabId:w.tabId,selector:'button',button:'middle'}),/INPUT_OUTCOME_UNKNOWN/,'Windows middle press/release without auxclick is an uncertain browser effect');
    fake.flags.seenOverride={beforeinput:1};
-   await assert.rejects(tool('browser_type',{tabId:w.tabId,selector:'input',text:'x'}),/INPUT_NOT_APPLIED/);
+   await assert.rejects(tool('browser_type',{tabId:w.tabId,selector:'input',text:'x'}),/INPUT_OUTCOME_UNKNOWN/);
+   fake.flags.seenOverride={keydown:1};
+   await assert.rejects(tool('browser_press',{tabId:w.tabId,key:'Enter'}),/INPUT_OUTCOME_UNKNOWN/,'a keydown alone cannot prove a complete press');
    fake.flags.seenOverride={click:1};
-   await assert.rejects(tool('browser_click',{tabId:w.tabId,selector:'button',clickCount:2}),/INPUT_NOT_APPLIED/);
-   fake.flags.seenOverride={click:2};
+   await assert.rejects(tool('browser_click',{tabId:w.tabId,selector:'button',clickCount:2}),/INPUT_OUTCOME_UNKNOWN/);
+   fake.flags.seenOverride={mousedown:2,mouseup:2,click:2};
    assert.equal((await tool('browser_click',{tabId:w.tabId,selector:'button',clickCount:2})).clicked,true);
    fake.flags.seenOverride=null;fake.flags.probeContextLost=true;
    await assert.rejects(tool('browser_click',{tabId:w.tabId,selector:'button'}),/INPUT_OUTCOME_UNKNOWN/);
-   assert.ok(!fake.cdpCalls.slice(start).some(c=>c.params.expression?.includes(')("domClick",')));
+   assert.ok(!fake.cdpCalls.slice(start).some(c=>/\)\("dom(?:Click|Type|Key)",/.test(c.params.expression||'')));
   }finally{fake.flags.seenOverride=null;fake.flags.probeContextLost=false;}
  });
  await t.test('group collapse also protects ungranted human tabs manually added to group',async()=>{fake.tabs.get(1).groupId=w.groupId;await assert.rejects(tool('browser_workspace_update',{workspaceId:w.workspaceId,collapsed:true}),/HUMAN_ACTIVE_TAB/);fake.tabs.get(1).groupId=-1;await tool('browser_workspace_update',{workspaceId:w.workspaceId,name:'Renamed',color:'yellow'});assert.equal(fake.groups.get(w.groupId).title,'🔎 Renamed');});

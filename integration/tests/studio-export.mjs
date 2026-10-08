@@ -18,7 +18,12 @@ try {
   delete env.ELECTRON_RUN_AS_NODE;
   const require = createRequire(resolve(root, 'companion/package.json'));
   app = await _electron.launch({ executablePath: require('electron'), args: [resolve(root, 'companion'), '--smoke-test', '--agent-mode'], env });
-  const studio = await app.firstWindow();
+  let studio;
+  for (let n = 0; n < 200 && !studio; n++) {
+    studio = app.windows().find(w => w.url().endsWith('/index.html'));
+    if (!studio) await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.ok(studio, 'Offscreen Studio editor did not load');
   await studio.waitForFunction(() => Boolean(window.companion));
   const state = await studio.evaluate(() => window.companion.getState());
   assert.equal(state.config.displayMode, 'both');

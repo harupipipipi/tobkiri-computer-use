@@ -10,6 +10,7 @@
     "check:cursor": "node integration/sync-cursor.mjs --check",
     "test": "node integration/sync-cursor.mjs && node --test integration/tests/*.test.mjs && npm --prefix browser test && npm --prefix companion test",
     "test:browser": "node integration/sync-cursor.mjs && node integration/tests/cursor-dom.mjs && node integration/tests/browser-live.mjs",
+    "test:browser:installed": "node integration/sync-cursor.mjs && node integration/tests/browser-live.mjs --browser chrome --native --studio --extended --require-trusted && node integration/tests/browser-live.mjs --browser msedge --native --studio --extended --require-trusted",
     "test:native": "node integration/sync-cursor.mjs && node integration/tests/native-smoke.mjs",
     "test:studio": "node integration/tests/studio-export.mjs",
     "mcp": "node integration/cli.mjs"

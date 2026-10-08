@@ -6,7 +6,8 @@ Baseline: Browser Use PR #1, commit `fbc67807a57b54d88a28925dcc4091d21c48981d`.
 This checkout imports its automation runtime; historical datasets and generated
 test artifacts are excluded. Earlier records below retain their original scope.
 
-Host: Windows, Node.js 22.23.1, isolated headless Chromium 153.0.8010.12.
+Host: Windows, Node.js 22.23.1, isolated headless Chromium 153.0.8010.12,
+installed Google Chrome 154.0.8037.98 and Microsoft Edge 154.0.4258.62.
 
 - Node tests: **66 passed** (9 broker/shared-pack tests, 47 browser tests,
   10 Studio engine/protocol tests). Browser permission unit tests use Chrome API
@@ -37,13 +38,48 @@ Host: Windows, Node.js 22.23.1, isolated headless Chromium 153.0.8010.12.
   all required checks on WindowsComputerFixture, including covered background
   capture/click/type/UIA scroll and approved foreground scroll/drag with restoration.
 
-Input probes now count required trusted events; beforeinput or a partial press
-cannot by itself prove click/type/drag delivery. Lost page context reports an
-uncertain result. DOM input is an explicit `inputRoute: "dom"` choice, with
+Additional installed Chrome/Edge acceptance: **17 checks each passed** using
+`npm run test:browser:installed`. Both use fresh headless profiles, the actual
+installed MV3 extension, production Cua schemas/resources (95 tools; desktop
+input denied), and an actual offscreen Electron Studio with isolated settings.
+Studio save IPC publishes the pack consumed by the next background operation.
+The basic trusted move/click/type checks require delivered input, rather than
+accepting a refusal as delivery. Extended checks exercised trusted drag
+(mousedown, two mousemoves, mouseup observed), double/right click, trusted/DOM
+Unicode contenteditable replacement and clearing, open Shadow DOM refs,
+stale/ambiguous/out-of-viewport refusal, and background navigation rebuilding
+the isolated world. Both preserved the human fixture's text/focus and produced
+**zero tab activation events** during background work. `document.hidden=false`
+on both with this headless/debugger setup; naturally hidden headed behavior is
+not established by these tests.
+
+**Known input limitation, not successful delivery:** middle click delivered
+trusted mousedown/mouseup but no auxclick on both browsers. This partial gesture
+now returns `INPUT_OUTCOME_UNKNOWN`, with no DOM replay. The 17 checks include
+this truthful refusal check; they are not 17 successful input operations. Raw
+reports expose `refusedInput` separately. An earlier run placed drag after middle
+click and also observed refused drag with zero page moves; drag before middle
+click delivered the complete path. Do not infer that a refused middle click had
+no browser effect or blindly retry it.
+
+Branded browsers are loaded through the test-only CDP
+[`Extensions.loadUnpacked`](https://chromedevtools.github.io/devtools-protocol/tot/Extensions/#method-loadUnpacked)
+with `--enable-unsafe-extension-debugging` in the disposable profile. This flag
+is not part of production MCP configuration or user's profile setup. The normal
+Chrome installation instructions remain the extension management page, because
+Chrome 137 removed the branded `--load-extension` command-line flag. The test
+also fixes an Electron first-window ordering race by identifying the actual
+Studio editor before invoking its save IPC.
+
+Input probes count required trusted events; beforeinput or a partial press
+cannot by itself prove click/type/drag delivery. Mouse press/release and the
+required click event count must all arrive; key press requires keydown/keyup,
+and typing requires an input event. Partial delivery and lost page context report
+an uncertain result. DOM input is an explicit `inputRoute: "dom"` choice, with
 `trusted:false`, rather than an automatic second attempt. An unacknowledged
 navigation is not replayed. A missing debugger attachment revokes the grant.
 
-Run from the repository root: `npm test`, `npm run test:browser`,
+Run from the repository root: `npm test`, `npm run test:browser`, `npm run test:browser:installed`,
 `npm run test:native`, `npm run test:studio`. Shared extension renderer code is generated locally from
 Studio sources and excluded from Git. Images/reports are local under
 `integration/artifacts`; they contain fictional test pages, no pairing secrets.
