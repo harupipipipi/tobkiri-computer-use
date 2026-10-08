@@ -11,6 +11,7 @@
     "test": "node integration/sync-cursor.mjs && node --test integration/tests/*.test.mjs && npm --prefix browser test && npm --prefix companion test",
     "test:browser": "node integration/sync-cursor.mjs && node integration/tests/cursor-dom.mjs && node integration/tests/browser-live.mjs",
     "test:native": "node integration/sync-cursor.mjs && node integration/tests/native-smoke.mjs",
+    "test:studio": "node integration/tests/studio-export.mjs",
     "mcp": "node integration/cli.mjs"
   }
 }

@@ -109,7 +109,7 @@ export function pageOp(op, a={}, renderFeedback=null) {
   if(op==='armInput') {
     const prev=globalThis.__tbkInput;
     if(prev)for(const t of prev.types)document.removeEventListener(t,prev.h,true);
-    const seen={};const h=e=>{if(e.isTrusted)seen[e.type]=1;};const types=a.types||[];
+    const seen={};const h=e=>{if(e.isTrusted)seen[e.type]=(seen[e.type]||0)+1;};const types=a.types||[];
     for(const t of types)document.addEventListener(t,h,true);
     globalThis.__tbkInput={seen,h,types};
     return {armed:true};

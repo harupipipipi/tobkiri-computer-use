@@ -92,6 +92,12 @@ try {
   trusted.type = await first.tool('tobkiri_tabs_type', { tabId, selector: '#entry', text: 'Trusted fixture' }, true);
   if (!trusted.type.error) assert.equal(await agent.locator('#entry').inputValue(), 'Trusted fixture');
   pass('Trusted input reports observed delivery without an automatic DOM retry', { click: trusted.click.error || 'delivered', type: trusted.type.error || 'delivered' });
+  if (!trusted.type.error) {
+    await first.tool('tobkiri_tabs_type', { tabId, selector: '#entry', text: '' });
+    assert.equal(await agent.locator('#entry').inputValue(), '');
+    assert.equal((await first.tool('tobkiri_tabs_type', { tabId, selector: '#entry', text: '' })).changed, false);
+    pass('Trusted empty replacement deletes selected text and repeated clearing is idempotent');
+  }
 
   await first.tool('tobkiri_tabs_type', { tabId, selector: '#entry', text: 'DOM fixture 日本語', inputRoute: 'dom' });
   assert.equal(await agent.locator('#entry').inputValue(), 'DOM fixture 日本語');

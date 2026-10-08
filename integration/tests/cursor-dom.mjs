@@ -24,7 +24,7 @@ try {
     check(document.elementFromPoint(480, 347).id === 'target', 'overlay passes pointer hit tests');
     check(host().shadowRoot === null, 'closed shadow does not enter the AX/DOM ref tree');
     const c = __tobkiriSharedCursor.canvas;
-    check(c.width === 840, 'DPI scales canvas resolution while coordinates stay CSS pixels');
+    check(c.width === Math.round(parseFloat(c.style.width) * 1.5), 'DPI scales canvas resolution while coordinates stay CSS pixels');
     check([...c.getContext('2d').getImageData(0, 0, c.width, c.height).data].some((v, i) => i % 4 === 3 && v > 0), 'real canvas pixels');
     const first = host();
     for (const action of ['move', 'click', 'drag', 'type', 'key', 'scroll', 'scroll_up']) {

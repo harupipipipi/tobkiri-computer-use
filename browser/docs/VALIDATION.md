@@ -1,4 +1,61 @@
-# Validation record — current branch (0.3.0)
+# Validation record
+
+## Unified Computer + Browser — 2026-10-08
+
+Baseline: Browser Use PR #1, commit `fbc67807a57b54d88a28925dcc4091d21c48981d`.
+This checkout imports its automation runtime; historical datasets and generated
+test artifacts are excluded. Earlier records below retain their original scope.
+
+Host: Windows, Node.js 22.23.1, isolated headless Chromium 153.0.8010.12.
+
+- Node tests: **66 passed** (9 broker/shared-pack tests, 47 browser tests,
+  10 Studio engine/protocol tests). Browser permission unit tests use Chrome API
+  mocks; they are distinct from installed-extension acceptance.
+- Installed MV3 extension + actual browser MCP + unified stdio broker:
+  **12 acceptance checks passed** on fictional loopback pages. Trusted CDP
+  move/click/type and empty replacement, explicit DOM click/type/check/Enter,
+  native select, eval, DOM scroll, screenshots, shared Studio rendering/settings,
+  ownership, active-tab protection, popup pause and debugger disconnection were
+  exercised. The native backend in this browser test is a schema-routing fixture.
+- The granted browser tab stayed `active:false`; **zero tab activation events**
+  occurred during background operations, and the human fixture kept its focused
+  field and text. With this Chromium/debugger combination `document.hidden` was
+  **false**. This is background-tab evidence, not natural hidden-rAF throttling
+  coverage. No focus emulation was enabled by the test or extension.
+- Shared renderer DOM/canvas: **23 checks passed**, including CSS coordinates,
+  DPI backing resolution, pointer-events passthrough, custom PNG, pet-only mode,
+  snapshot exclusion, viewport edges, expiry and resize invalidation. Suspended
+  rAF/hidden lifecycle is simulated explicitly in this separate rendering test.
+- Actual Electron Studio save IPC was exercised with offscreen rendering and
+  isolated settings: startup publishes cursor+pet defaults, saving changes
+  updates the shared pack, and every native window remains invisible. This tests
+  the publisher rather than replacing it with a fake file writer.
+- Production native Cua 0.28.2 + combined MCP smoke: **95 tools**, skill resource,
+  browser-offline refusal and retained native connection verified. No desktop
+  input occurs in that smoke test.
+- Windows Python: **250 passed**. Existing opt-in live acceptance also passed
+  all required checks on WindowsComputerFixture, including covered background
+  capture/click/type/UIA scroll and approved foreground scroll/drag with restoration.
+
+Input probes now count required trusted events; beforeinput or a partial press
+cannot by itself prove click/type/drag delivery. Lost page context reports an
+uncertain result. DOM input is an explicit `inputRoute: "dom"` choice, with
+`trusted:false`, rather than an automatic second attempt. An unacknowledged
+navigation is not replayed. A missing debugger attachment revokes the grant.
+
+Run from the repository root: `npm test`, `npm run test:browser`,
+`npm run test:native`, `npm run test:studio`. Shared extension renderer code is generated locally from
+Studio sources and excluded from Git. Images/reports are local under
+`integration/artifacts`; they contain fictional test pages, no pairing secrets.
+
+Not claimed: headed user Chrome/Edge, real user profiles, arbitrary sites,
+production host UI, native browser dialogs, full cross-origin iframe DOM,
+service-worker longevity, or macOS integrated GUI delivery. Running macOS pytest
+on this Windows host gave 247 passes and 27 failures in OS-specific/runtime/
+encoding paths; this is not a macOS validation result. Use a macOS host for the
+documented macOS suite and fixture acceptance.
+
+## Historical standalone Browser Use records
 
 ## Brand icon and visible pointer — 2026-10-03
 

@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { cursorRuntime } from '../../browser/extension/character-runtime.mjs';
 import { defaults, validatePack } from '../../companion/src/config.js';
 import { poseFor } from '../../companion/src/engine.js';
@@ -22,8 +22,10 @@ test('extension bundle equals the canonical desktop engine and all motion poses'
 });
 
 test('shared presentation reloads edits and rejects invalid/missing data without input', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'tobkiri-cursor-test-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  const base = fileURLToPath(new URL('../artifacts/', import.meta.url));
+  await mkdir(base, { recursive: true });
+  const dir = await mkdtemp(join(base, 'cursor-test-'));
+  t.after(() => { assert.ok(dir.startsWith(base)); return rm(dir, { recursive: true, force: true }); });
   const path = join(dir, 'cursor-pack.json'), read = packReader({ cursorPackPath: path });
   assert.deepEqual(await read(), { pack: null, error: null });
   await writeFile(path, JSON.stringify(defaults));

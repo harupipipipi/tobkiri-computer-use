@@ -167,6 +167,11 @@ npm test          # Nodeのサーバー・権限制御テスト
 
 ## 開発・検証
 
+このWindows統合版では、ルートの `npm run test:browser` が専用プロファイルの
+ヘッドレスChromiumに実拡張を読み込む通し試験です。共有描画コードはsetup/試験/統合起動時に
+生成します。元プロジェクトのPython試験は下記に残していますが、今回の検証経路は
+[統合手順](../integration/README.md) を参照してください。
+
 ```sh
 npm test
 
@@ -199,6 +204,6 @@ long-pollは15秒ごとにしか操作しないという意味ではありませ
 
 既存OSSでは `hangwin/mcp-chrome` が近い設計です。本プロジェクトはそのコードのコピーではなく、タブ別許可と人間の前面操作を優先する小さい独立実装です。参照した仕様は [REFERENCES.md](docs/REFERENCES.md)。
 
-## AIデザインデータセット
+## 取り込み範囲
 
 この統合版はブラウザ操作部分だけを取り込んでいます。元リポジトリのデータ収集スクリプトと評価データは含めません。取り込み元と変更範囲は [UPSTREAM.md](UPSTREAM.md)、統合起動は [integration/README.md](../integration/README.md) を参照してください。

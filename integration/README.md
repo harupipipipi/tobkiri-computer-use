@@ -40,6 +40,7 @@ node integration/cli.mjs --computer "$PWD\windows\.venv\Scripts\tobkiri-computer
 Cuaの `target_id` / `tab_id` と拡張の整数 `tabId` は交換できません。
 
 Studioのキャラクター・色・手描きPNG・しぐさ・petだけ/カーソル＋petの設定は両方に適用されます。
+統合起動の新規設定は「カーソル＋pet」で開始します。コード更新後はStudioを再起動してください。
 変更はブラウザの次の操作で反映します。共有ファイルは既定でBrowser設定の隣の
 `cursor-pack.json`。新しいStudioが既に起動中のStudioに接続した場合もこのファイルを更新します。
 拡張内の描画コードは `companion/src` から生成し、`npm run check:cursor` で一致を確認します。
@@ -56,7 +57,7 @@ DOM clickは一回の左クリックに対応します。CSS hover、ネイテ�
 ## Windowsで確認できた範囲
 
 2026-10-08にWindows上の隔離したヘッドレスChromium 153で、実際に読み込んだMV3拡張と
-統合MCPの通し試験11項目が成功しました。CDP move/click/type、DOM入力、スクロール、
+統合MCPの通し試験12項目が成功しました。CDP move/click/type、DOM入力、スクロール、
 画像取得、同じStudioキャラの描画、設定更新、所有権・一時停止・前面タブ保護を確認しています。
 背景タブの `active` はfalseで、試験中のタブ前面化イベントは0件です。
 このChromiumではdebugger接続中の `document.hidden` はfalseでした。
@@ -76,6 +77,8 @@ macOS用pytestをWindowsで実行した結果はOS固有処理等で失敗して
 ```powershell
 npm test
 npm run test:browser
+npm run test:native
+npm run test:studio
 cd windows
 .\.venv\Scripts\python.exe -m pytest -q
 ```
@@ -85,3 +88,6 @@ cd windows
 Chromiumが未導入なら `npm exec --prefix companion -- playwright install chromium` で用意します。
 画像・生レポートは `integration/artifacts/` に保存し、Gitには含めません。
 通常のGUI実機試験はOS別READMEの既存の専用fixture用スクリプトだけを使います。
+`test:native` は実際のCuaへ接続してスキーマとSkillだけを読み、デスクトップ入力を行いません。
+`test:studio` は別の設定ディレクトリと画面を出さないElectron描画で、実際の保存IPCから
+共有ファイルへの反映を確認します。ユーザーのStudio設定は操作しません。

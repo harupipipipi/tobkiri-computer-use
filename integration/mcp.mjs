@@ -85,7 +85,7 @@ export function runUnified({ computer, browser, input = process.stdin, output = 
   const error = (id, code, message) => send({ jsonrpc: '2.0', id, error: { code, message } });
   const state = () => ({ computer: { connected: Boolean(nativeInit && !computer.failure), error: computer.failure },
     browser: { connected: Boolean(browserInit && !browser.failure), error: browser.failure },
-    cursor: { renderer: 'cursor-studio', browserCoordinates: 'css_viewport_pixels', hiddenTabDesktopProjection: false },
+    cursor: { rendererImplementation: 'cursor-studio', visibilityVerified: false, browserCoordinates: 'css_viewport_pixels', hiddenTabDesktopProjection: false },
     retries: false });
   const close = () => {
     if (closed) return; closed = true;

@@ -36,6 +36,14 @@ test('loopback bridge authenticates and rejects web Origin / rebinding Host',asy
  assert.equal((await request(c,'/status')).product,'tobkiri-tabs');
 });
 test('extension Origin cannot access the internal RPC or admin API',async t=>{const c=await fixture(t);const r=await fetch(`http://127.0.0.1:${c.port}/shutdown`,{method:'POST',headers:{Authorization:`Bearer ${c.token}`,Origin:`chrome-extension://${'a'.repeat(32)}`,'Content-Type':'application/json'},body:'{}'});assert.equal(r.status,403);});
+
+test('shared cursor configuration is a trusted local endpoint, never an extension grant',async t=>{
+ const c=await fixture(t);
+ const blocked=await fetch(`http://127.0.0.1:${c.port}/cursor/configure`,{method:'POST',headers:{Authorization:`Bearer ${c.token}`,Origin:`chrome-extension://${'a'.repeat(32)}`,'Content-Type':'application/json'},body:JSON.stringify({path:join(tmpdir(),'cursor.json')})});
+ assert.equal(blocked.status,403);
+ await assert.rejects(request(c,'/cursor/configure',{path:'relative.json'}),/Absolute/);
+ assert.equal((await request(c,'/cursor/configure',{path:join(tmpdir(),'cursor.json')})).ok,true);
+});
 test('offline operations fail explicitly; status remains available',async t=>{const c=await fixture(t),sessionId=await register(c);assert.equal((await request(c,'/rpc',{sessionId,name:'browser_status',args:{}})).result.connected,false);await assert.rejects(request(c,'/rpc',{sessionId,name:'browser_workspace_create',args:{name:'test'}}),/EXTENSION_OFFLINE/);});
 test('bridge routes commands by generated session owner and returns results',async t=>{
  const c=await fixture(t),sessionId=await register(c),{connectionId}=await pair(c);

@@ -18,6 +18,15 @@ function option(name, fallback) {
   return options[index + 1];
 }
 try {
+  if (options.includes('--help')) {
+    console.log('Tobkiri unified stdio MCP\n  node integration/cli.mjs [--computer EXE] [--browser-config PATH] [--cursor-pack PATH] [--no-companion] [-- NATIVE_ARGS]\n  npm run setup prints extension pairing and host configuration.');
+    process.exit(0);
+  }
+  for (let i = 0; i < options.length; i++) {
+    if (options[i] === '--no-companion') continue;
+    if (!['--computer', '--browser-config', '--cursor-pack'].includes(options[i])) throw Error(`Unknown option: ${options[i]}. Use -- before native MCP arguments.`);
+    option(options[i]); i++;
+  }
   await syncCursor();
   const computerPath = option('--computer', resolve(root, process.platform === 'win32'
     ? 'windows/.venv/Scripts/tobkiri-computer-use.exe' : 'mac/.venv/bin/tobkiri-computer-use'));

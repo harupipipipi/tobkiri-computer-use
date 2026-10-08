@@ -44,7 +44,7 @@ let agentMode = process.argv.includes("--agent-mode");
 // Opt-in for the user's live recording. Normally overlays stay out of captures.
 const recordable = process.argv.includes("--recordable");
 if (smokeTest)
-  app.setPath("userData", path.join(__dirname, "test-results", "runtime"));
+  app.setPath("userData", process.env.TOBKIRI_SMOKE_USER_DATA || path.join(__dirname, "test-results", "runtime"));
 if (recordTest)
   app.setPath(
     "userData",
@@ -175,6 +175,7 @@ else {
           JSON.parse(await fs.readFile(configFile, "utf8")),
         );
       } catch (error) {
+        if (error.code === "ENOENT" && sharedPackFile) config.displayMode = "both";
         if (error.code !== "ENOENT")
           status =
             "保存した設定を読み込めませんでした。標準設定で起動しました。";

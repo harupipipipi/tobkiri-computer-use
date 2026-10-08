@@ -29,10 +29,10 @@ export function renderSharedCursor(action, point, pack, runtime, idleMs = 3500) 
     const shadow = host.attachShadow({ mode: 'closed' });
     const canvas = document.createElement('canvas');
     // A bounded canvas around the point, independent of viewport/DPI size.
-    canvas.style.cssText = 'position:absolute;left:-280px;top:-280px;width:560px;height:560px;pointer-events:none;';
+    canvas.style.cssText = 'position:absolute;pointer-events:none;';
     shadow.append(canvas);
     (document.documentElement || document.body).append(host);
-    state = { host, canvas, character: new runtime.Character(pack, 280, 280),
+    state = { host, canvas, extent: 280, character: new runtime.Character(pack, 280, 280),
       timer: null, frame: null, expiresAt: 0, last: performance.now(), x, y };
     state.onVisibility = () => {
       if (Date.now() >= state.expiresAt) remove();
@@ -45,11 +45,12 @@ export function renderSharedCursor(action, point, pack, runtime, idleMs = 3500) 
     globalThis.__tobkiriSharedCursor = state;
   }
   function draw() {
-    const dpr = Math.min(devicePixelRatio || 1, 2), size = Math.round(560 * dpr);
+    const width = state.extent * 2;
+    const dpr = Math.min(devicePixelRatio || 1, 2), size = Math.round(width * dpr);
     if (state.canvas.width !== size) state.canvas.width = state.canvas.height = size;
     const ctx = state.canvas.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, 560, 560);
+    ctx.clearRect(0, 0, width, width);
     state.character.draw(ctx, { shadow: false });
   }
   function frame(now) {
@@ -64,10 +65,15 @@ export function renderSharedCursor(action, point, pack, runtime, idleMs = 3500) 
     if (!document.hidden && state.frame === null) state.frame = requestAnimationFrame(frame);
   }
   state.character.pack = pack;
+  // Valid custom poses can extend 200 units plus the character offset. Keep
+  // their full bounds at Studio's maximum size, with a fixed memory bound.
+  const extent = state.extent = Math.ceil(Math.max(280, pack.size / 100 * 260 + 25));
+  state.canvas.style.left = state.canvas.style.top = `${-extent}px`;
+  state.canvas.style.width = state.canvas.style.height = `${extent * 2}px`;
   // Place the hotspot synchronously, including when the tab's rAF is suspended.
   state.x = x; state.y = y;
-  state.character.x = state.character.tx = 280;
-  state.character.y = state.character.ty = 280;
+  state.character.x = state.character.tx = extent;
+  state.character.y = state.character.ty = extent;
   state.host.style.setProperty('left', `${x}px`, 'important');
   state.host.style.setProperty('top', `${y}px`, 'important');
   state.host.dataset.action = action;
