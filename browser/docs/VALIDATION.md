@@ -91,6 +91,27 @@ on this Windows host gave 247 passes and 27 failures in OS-specific/runtime/
 encoding paths; this is not a macOS validation result. Use a macOS host for the
 documented macOS suite and fixture acceptance.
 
+### Fictional SNS demonstration — 2026-10-08
+
+`npm run test:social` exercises the local 「こもれび」 SNS on the installed
+headless Chrome/Edge through the production MV3 extension and unified tab MCP.
+Each passed **6 checks and 8 persisted UI mutations**: trusted clicks follow/like
+葵, explicit DOM clicks follow/like 凪, and 葵's follow/like are removed then
+reapplied. Fresh snapshot refs select each button. The page's pressed state,
+counts, server change ledger and saved JSON agree; likes become 19/43/9 and
+followers 129/97/204 with no duplicate increment. Reload restores **2 follows
+and 2 liked posts**. Shared cursor screenshots were visually inspected; tab
+activation remained **0** and the foreground human fixture kept its focus/text.
+
+All users/posts/accounts are fictional. The server binds only to 127.0.0.1;
+no external social service is accessed. The native backend is a routing fixture
+and no OS input is used. Page-reported trusted flags are diagnostic, not an
+authorization mechanism. Error handling stops without input replay. This is a
+local SNS fixture result, not evidence about real social services or natural
+headed hidden-tab behavior. Images, state JSON and reports remain ignored in
+`integration/artifacts/social-demo`. `npm run demo:social` can display the saved
+Edge result locally; see `integration/demos/social/README.md`.
+
 ## Historical standalone Browser Use records
 
 ## Brand icon and visible pointer — 2026-10-03

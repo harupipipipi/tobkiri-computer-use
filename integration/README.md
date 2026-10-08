@@ -89,6 +89,12 @@ macOS用pytestをWindowsで実行した結果はOS固有処理等で失敗して
 
 ## 検証コマンド
 
+架空SNSでのフォロー・いいねの実演は
+[`demos/social/README.md`](demos/social/README.md) にあります。
+`npm run test:social` でChrome/Edgeから実際に8回の操作を行い、
+フォロー2人・いいね2件、解除と再適用、再読み込み後の保存状態を確認します。
+`npm run demo:social` で保存済みの結果をブラウザから見られます。
+
 ```powershell
 npm test
 npm run test:browser
