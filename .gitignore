@@ -9,7 +9,9 @@ artifacts
 *.log
 node_modules/
 /companion/test-results/
-/browser/extension/character-runtime.mjs
+# Historical local demo artifacts; Browser Use is maintained in its own repo.
+/browser/
+/integration/
 .env
 .env.*
 !.env.example

@@ -89,9 +89,9 @@ Studioから入力命令を実行するAPIはありません。元の入力API�
 MCPの `tobkiri_act` とPythonのWindow APIは同じ経路です。
 観測済みの対象を持つ低レベルCua呼び出しも対応します。
 ブラウザのCDP専用API、未観測の対象、任意の他アプリの操作はこのUDP通知の対象外です。
-一方、[統合起動](../integration/README.md) の拡張 `tobkiri_tabs_*` はページ内に同じStudioの
-キャラクターとカーソルを描きます。色・手描きPNG・しぐさ・表示モードの編集は次のブラウザ操作で
-反映します。背景タブのCSS座標をデスクトップへ投影しません。
+起動環境の `TOBKIRI_CURSOR_PACK` にJSONの絶対パスを指定すると、見た目の設定だけを
+そのファイルへ書き出します。Browser Useなどで同じ見た目を使いたい場合の任意機能です。
+入力命令やタブ情報は含めず、Browserの起動やMCP接続は行いません。
 
 ## できること
 
@@ -127,7 +127,8 @@ MCPの `tobkiri_act` とPythonのWindow APIは同じ経路です。
 ## 自分のキャラクターを作る
 
 設定画面上部の「表示」で **petだけ（カーソル非表示）** と **カーソル＋pet** を
-切り替えます。標準はpetだけです。矢印・クリックの輪・カーソルの軌跡が消え、
+切り替えます。標準はpetだけです。JSONを書き出す `TOBKIRI_CURSOR_PACK` 起動では、
+初期設定がカーソル＋petになります。petだけにすると矢印・クリックの輪・カーソルの軌跡が消え、
 キャラクターの動きと実際の入力位置は維持されます。色や自作カーソルは保持します。
 JSONでは `displayMode: "pet"` / `"both"`。既存の設定にこの項目がなければpetだけになります。
 
@@ -173,6 +174,7 @@ npm test
 npx playwright install chromium
 npm run test:ui
 npm run test:desktop
+npm run test:export
 ```
 
 実ウィンドウを30秒録画して描画間隔を計測するには、WindowsでFFmpegをPATHに置き、

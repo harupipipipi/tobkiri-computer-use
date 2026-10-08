@@ -102,3 +102,12 @@ Run `npm test`, `npm run test:ui`, `npm run test:desktop` and the Windows Python
 `npm run record -- motion-check` records the Studio demo. For authorized real-app
 recording use `tests/live-record.mjs` as described in the README. Observation and
 input are separate MCP actions; the recording script itself does not operate apps.
+
+## Independent Cursor Studio export — 2026-10-08
+
+`npm run test:export` exercises the actual offscreen Electron editor and save IPC
+with temporary isolated settings. `TOBKIRI_CURSOR_PACK` publishes cursor+pet
+defaults, and saving updates the JSON. Every native window stays invisible.
+This is presentation export only: no Browser process, desktop input, visible
+window, global shortcut, tray or existing user profile is used. The test artifact
+is ignored and the temporary settings are removed.
