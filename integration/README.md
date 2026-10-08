@@ -37,6 +37,8 @@ node integration/cli.mjs --computer "$PWD\windows\.venv\Scripts\tobkiri-computer
 最初に `tobkiri_tabs_status`、続いて `tobkiri_tabs_workspace_create` でAIタブを作り、
 返された `tabId` / `workspaceId` を使います。既存タブは拡張のポップアップで人間が渡します。
 `tobkiri_tabs_eval` で許可されたタブのDOMを操作できます。
+`tobkiri_tabs_network_start/read/body/routes/stop` で通信記録、本文取得、期限付きの
+ブロック・リクエスト変更・模擬応答が使えます。[通信操作の詳細](../browser/docs/NETWORK.md)。
 Cuaの `target_id` / `tab_id` と拡張の整数 `tabId` は交換できません。
 
 Studioのキャラクター・色・手描きPNG・しぐさ・petだけ/カーソル＋petの設定は両方に適用されます。
@@ -94,6 +96,7 @@ macOS用pytestをWindowsで実行した結果はOS固有処理等で失敗して
 `npm run test:social` でChrome/Edgeから実際に8回の操作を行い、
 フォロー2人・いいね2件、解除と再適用、再読み込み後の保存状態を確認します。
 `npm run demo:social` で保存済みの結果をブラウザから見られます。
+`npm run test:network` は同じ架空SNSでDOM書き換えと通信操作も検証します。
 
 ```powershell
 npm test
@@ -101,6 +104,7 @@ npm run test:browser
 npm run test:browser:installed
 npm run test:native
 npm run test:studio
+npm run test:network
 cd windows
 .\.venv\Scripts\python.exe -m pytest -q
 ```

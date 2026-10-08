@@ -16,6 +16,9 @@ AI専用のタブを色付きグループにまとめ、別のタブを人間が
 | スクロール | 一番近いスクロール可能なDOM要素を直接スクロール |
 | スクリーンショット | 対象タブの `Page.captureScreenshot`。通常/全ページ、PNG/JPEG、MCP image応答 |
 | フォーム | checkbox/radio、native select、条件待ち |
+| DOM・コンソール相当のJS | `browser_eval` で対象ページのMAIN worldを実行 |
+| 通信記録・本文取得 | 対象タブのCDP Networkイベントを件数・容量制限付きで保存 |
+| 通信ブロック・書き換え・模擬応答 | CDP FetchのURL条件ルール。期限付きで自動処理 |
 | 人間優先 | 前面タブへの変更操作を標準で拒否。読み取りは可能 |
 | 複数MCPクライアント | MCPプロセスごとに別セッション。別セッションの許可タブは取得・操作不可 |
 
@@ -44,7 +47,7 @@ Chromeの `chrome://extensions` を開き、デベロッパーモードを有効
 
 拡張アイコンを開いてペアリングコードを入力します。「AI専用タブの新規作成を許可する」を選び、「接続して、AI用の作業場所を用意」を押します。許可しなくても、人間が個別に渡した既存タブの操作はできます。
 
-Chrome 120以上を対象にしています。Edge / Brave等のChromium系で利用できる可能性はありますが、この版では実機未検証です。Firefox / Safari向けではありません。組織のポリシーが拡張やdebuggerを禁止している場合、その制限を回避せず管理者に確認してください。
+Chrome 120以上を対象にしています。Windowsの通常版Chrome / Edgeは専用ヘッドレスプロフィールで実拡張を検証しています。Braveや画面表示した通常プロフィールは未検証です。Firefox / Safari向けではありません。組織のポリシーが拡張やdebuggerを禁止している場合、その制限を回避せず管理者に確認してください。
 
 ### 3. MCPホストに登録する
 
@@ -85,6 +88,7 @@ MCPプロセス起動時、ブリッジが停止していれば自動起動し�
 ## MCPツール
 
 ツールのJSON Schemaと詳しい説明は `extension/shared.mjs` にあります。
+通信操作の手順・範囲・期限は [DOM・通信操作](docs/NETWORK.md) を参照してください。
 
 | 用途 | ツール |
 |---|---|
@@ -94,6 +98,8 @@ MCPプロセス起動時、ブリッジが停止していれば自動起動し�
 | 読み取り・画像 | `browser_snapshot`, `browser_screenshot`, `browser_pdf` |
 | 操作 | `browser_move`, `browser_click`, `browser_type`, `browser_press`, `browser_scroll`, `browser_drag` |
 | フォーム・待機 | `browser_select`, `browser_check`, `browser_wait` |
+| JS・生CDP | `browser_eval`, `browser_cdp` |
+| 通信 | `browser_network_start`, `browser_network_read`, `browser_network_body`, `browser_network_routes`, `browser_network_stop` |
 
 例：
 

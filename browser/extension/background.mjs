@@ -5,10 +5,21 @@ import {renderCursor} from './cursor-overlay.mjs';
 import {CURSOR_THEME} from './cursor-theme.mjs';
 import {cursorRuntime} from './character-runtime.mjs';
 import {renderSharedCursor} from './shared-cursor-overlay.mjs';
+import {createNetworkController} from './network.mjs';
 
 let config={enabled:false,allowCreate:false,protectActive:true,port:17653,token:''};
 let workspaces={},grants={},audit=[],clients=[],connected=false,lastError='',connectionId=null;
 let epoch=0,loopRunning=false,reconnectTimer=null;const attached=new Set(),worlds=new Map(),locks=new Map(),canceled=new Set(),intentionalDetach=new Set(),screencastWaiters=new Map();
+const network=createNetworkController({send:sendNetwork,
+  active:tabId=>attached.has(tabId),
+  authorize:(tabId,owner,mutating)=>guard(tabId,{owner,epoch,id:'network-event',deadline:Date.now()+5000},mutating),
+  abort:async(tabId,e)=>{if(grants[tabId])grants[tabId].revoked=true;record('network-stopped',tabId,e.code||'error');await detach(tabId);}});
+async function sendNetwork(tabId,method,params){
+  if(!attached.has(tabId))throw new AppError('DEBUGGER_DETACHED','Network session detached; no command was retried.');
+  let timer;
+  try{return await Promise.race([chrome.debugger.sendCommand({tabId},method,params),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new AppError('CDP_TIMEOUT','Network command did not acknowledge; no command was retried.')),5000);})]);}
+  finally{clearTimeout(timer);}
+}
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const boot=(async()=>{
   await chrome.storage.local.setAccessLevel({accessLevel:'TRUSTED_CONTEXTS'});
@@ -16,7 +27,11 @@ const boot=(async()=>{
   if(!config.instanceId){config.instanceId=crypto.randomUUID();await chrome.storage.local.set({config});}
   const s=await chrome.storage.session.get(['workspaces','grants','audit']);workspaces=s.workspaces||{};grants=s.grants||{};audit=s.audit||[];
   // If Chrome killed the worker, adopt only debugger targets that are ALSO in our explicit grant ledger.
-  try{const targets=await chrome.debugger.getTargets();for(const t of targets)if(t.attached && grants[t.tabId] && !grants[t.tabId].revoked)attached.add(t.tabId);}catch{}
+  try{const targets=await chrome.debugger.getTargets();for(const t of targets)if(t.attached && grants[t.tabId] && !grants[t.tabId].revoked){
+    attached.add(t.tabId);
+    // Memory-only routes cannot survive a worker restart. Release orphan pauses.
+    try{await sendNetwork(t.tabId,'Fetch.disable',{});await sendNetwork(t.tabId,'Network.disable',{});}catch{await detach(t.tabId);}
+  }}catch{}
   await chrome.alarms.create('bridge-reconnect',{periodInMinutes:0.5});await badge();
 })();
 function record(name,tabId,status) {audit.unshift({at:new Date().toISOString(),name,tabId:tabId??null,status});audit=audit.slice(0,120);void persist();}
@@ -71,6 +86,7 @@ async function guard(tabId,ctx,mutating=true) {
   checkpoint(ctx);return tab;
 }
 async function detach(tabId) {
+  network.forget(tabId);
   worlds.delete(tabId);
   if(!attached.has(tabId))return;attached.delete(tabId);intentionalDetach.add(tabId);
   try{await chrome.debugger.detach({tabId});}catch{}finally{setTimeout(()=>intentionalDetach.delete(tabId),1000);}
@@ -346,8 +362,13 @@ async function dispatch(name,a,ctx) {
   }
   if(name==='browser_tab_open')return await newTab(owner,a.workspaceId,a.url,ctx);
   if(name==='browser_tab_navigate')return await navigate(a.tabId,a.url,ctx,a.timeoutMs);
-  const readOnly=['browser_snapshot','browser_screenshot','browser_wait'].includes(name);
+  const readOnly=['browser_snapshot','browser_screenshot','browser_wait','browser_network_read','browser_network_body'].includes(name);
   await attach(a.tabId,ctx,!readOnly);
+  if(name==='browser_network_start')return await network.start(a.tabId,owner,a);
+  if(name==='browser_network_read')return network.read(a.tabId,owner,a);
+  if(name==='browser_network_body')return await network.body(a.tabId,owner,a);
+  if(name==='browser_network_routes')return await network.routes(a.tabId,owner,a);
+  if(name==='browser_network_stop')return await network.stop(a.tabId,owner);
   if(name==='browser_snapshot')return await page(a.tabId,'snapshot',a,ctx,false);
   if(name==='browser_move'){
     const p=await point(a.tabId,a,ctx);
@@ -474,12 +495,14 @@ async function runCommand(message,cid) {
   });locks.set(key,job);await job;if(locks.get(key)===job)locks.delete(key);
 }
 chrome.debugger.onDetach.addListener((source,reason)=>{
+  network.forget(source.tabId);
   attached.delete(source.tabId);worlds.delete(source.tabId);
   if(!intentionalDetach.has(source.tabId) && grants[source.tabId] && reason==='canceled_by_user'){
     grants[source.tabId].revoked=true;record('debugger-detached',source.tabId,'revoked');void persist();
   }
 });
 chrome.debugger.onEvent.addListener((source,method,params)=>{
+  void network.event(source,method,params).catch(e=>record('network-event',source.tabId,e.code||'error'));
   const tabId=source.tabId;
   if(method==='Page.frameNavigated' && !params.frame.parentId)worlds.delete(tabId);
   if(method==='Runtime.executionContextsCleared')worlds.delete(tabId);
@@ -492,12 +515,16 @@ chrome.debugger.onEvent.addListener((source,method,params)=>{
     if(w){clearTimeout(w.timer);screencastWaiters.delete(tabId);w.resolve(params);}
   }
 });
+chrome.tabs.onActivated.addListener(({tabId})=>{
+  // Detaching cancels interception before an active user tab continues to be used.
+  if(config.protectActive && network.has(tabId))void detach(tabId);
+});
 chrome.tabGroups.onRemoved.addListener(group=>{for(const w of Object.values(workspaces))if(w.groupId===group.id)w.groupId=null;void persist();});
 chrome.tabs.onRemoved.addListener(tabId=>{delete grants[tabId];attached.delete(tabId);worlds.delete(tabId);void persist();});
 // Dev convenience: an unpacked extension's files can change on disk while a packed install's
 // cannot, so a content-hash change means the sources were edited — reload once it stays stable
 // across two alarm polls (~60s) to avoid reloading into a half-written file.
-const devFiles=['manifest.json','background.mjs','page-ops.mjs','cursor-overlay.mjs','cursor-theme.mjs','character-runtime.mjs','shared-cursor-overlay.mjs','vendor/lucide/mouse-pointer-2.mjs','shared.mjs','popup.mjs','popup.html','popup.css'];
+const devFiles=['manifest.json','background.mjs','network.mjs','page-ops.mjs','cursor-overlay.mjs','cursor-theme.mjs','character-runtime.mjs','shared-cursor-overlay.mjs','vendor/lucide/mouse-pointer-2.mjs','shared.mjs','popup.mjs','popup.html','popup.css'];
 let devHash='',devPending='',devStable=0;
 async function devHotReload() {
   try{

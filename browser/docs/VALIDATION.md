@@ -112,6 +112,57 @@ headed hidden-tab behavior. Images, state JSON and reports remain ignored in
 `integration/artifacts/social-demo`. `npm run demo:social` can display the saved
 Edge result locally; see `integration/demos/social/README.md`.
 
+## DOM/network and Windows native follow-up — 2026-10-08
+
+Added structured, exact-tab `network_start/read/body/routes/stop` tools (the unified
+broker exposes `tobkiri_tabs_network_*`). Captures are bounded, memory-only and
+owner-scoped. Cookie/authorization headers are redacted. Automatic request-stage
+rules can block, provide a UTF-8 mock response, or modify URL/method/headers/body.
+Rules have a 30-second default lease (five minutes maximum). Pause, release,
+detach, protected human activation and worker restart remove interception.
+Fetch pauses never wait on the MCP tool lock; unknown command outcomes detach
+without a second settlement. Metadata checks are queued in arrival order, while
+Fetch settlement stays independent. Unit tests cover release/clear racing a
+permission check and delayed metadata guards.
+
+`npm run test:network` passed **14 checks on each installed Chrome/Edge** above,
+using fresh headless profiles, actual MV3 extension and production unified tab MCP:
+
+- MAIN-world eval changes the SNS heading text/style/attribute.
+- Network events provide real request/response metadata and finished JSON body.
+- A UTF-8 mock response changes the displayed post while server state stays intact;
+  the fictional server confirms that the intercepted request never arrived.
+- A blocked request rejects in the page and never arrives at the server.
+- URL/header changes and HTTP method/body changes are confirmed by server receipts.
+- Six simultaneous paused GETs continue when the method condition does not match,
+  even while Runtime.evaluate awaits all fetches; no MCP deadlock occurs.
+- Lease expiry and explicit stop restore real responses. Stop erases the log.
+- Previous SNS follow/like and persistence checks still pass. Both browsers report
+  **zero tab activation** and unchanged human-fixture focus/text.
+
+Artifacts are ignored under `integration/artifacts/network-demo/{chrome,msedge}`.
+Screenshots `dom-modified.png` and `network-mocked.png` were visually inspected.
+This is root-tab network evidence, not full child-worker/OOPIF capture, response-stage
+interception, arbitrary-site coverage or naturally hidden headed browser validation.
+
+Windows native `live_acceptance_windows.py` was rerun with Cua **0.28.2**, using only
+WindowsComputerFixture and **without `--allow-foreground`**. Ten executed checks
+passed; the two foreground fallback checks were skipped. Covered-window capture,
+semantic and screenshot-coordinate click, value replacement, background typing,
+UIA scroll, stale-token rejection and fresh observations passed. Target event receipts
+confirm count **2** and applied text **Typed in background**; foreground fixture and
+physical pointer stay unchanged during background inputs. Pixel scroll and background
+drag correctly refuse unsupported delivery instead of escalating. Before/after images
+are ignored in `windows/artifacts/network-turn-native-acceptance-*.png`.
+
+Final unit suites: **79 Node tests** (9 integration, 60 browser, 10 Studio) and
+**250 Windows pytest tests**. Loopback transports and temporary-directory access
+require host execution in this sandbox; restricted-run failures were rerun with the
+same test code on the host. No normal unit test sends desktop input.
+The final `npm run test:native` connects production Cua 0.28.2 with the unified
+MCP's **100 tools** and packaged skill, preserving native access when the extension
+is offline. That smoke check sends no desktop input.
+
 ## Historical standalone Browser Use records
 
 ## Brand icon and visible pointer — 2026-10-03

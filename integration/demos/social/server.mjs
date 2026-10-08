@@ -42,6 +42,7 @@ export async function createSocialServer({ stateFile, port = 0, fresh = false } 
   }
   await save();
   let base;
+  const requests=[]; // Bounded fictional-fixture receipts for network acceptance.
   const server = createServer(async (req, res) => {
     const json = (status, value) => {
       res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -50,6 +51,9 @@ export async function createSocialServer({ stateFile, port = 0, fresh = false } 
     try {
       if (req.headers.host !== new URL(base).host) return json(403, { error: 'Loopback fixture only' });
       const url = new URL(req.url, base);
+      const receipt={method:req.method,path:url.pathname+url.search,testHeader:req.headers['x-tobkiri-test']??null};
+      requests.push(receipt);
+      if(requests.length>200)requests.shift();
       if (req.method === 'GET' && url.pathname === '/api/state') return json(200, state);
       if (req.method === 'GET' && url.pathname === '/human') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -68,6 +72,7 @@ export async function createSocialServer({ stateFile, port = 0, fresh = false } 
         if (Buffer.byteLength(body) > 4096) return json(413, { error: 'Request too large' });
       }
       const input = JSON.parse(body);
+      receipt.body=input;
       if (typeof input.enabled !== 'boolean') return json(400, { error: 'enabled must be boolean' });
       const [ , kind, id ] = match;
       const record = (kind === 'follow' ? state.users : state.posts).find(item => item.id === id);
@@ -86,7 +91,7 @@ export async function createSocialServer({ stateFile, port = 0, fresh = false } 
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
   base = `http://127.0.0.1:${server.address().port}`;
-  return { base, server, getState: () => structuredClone(state), close: async () => { await saveQueue; await new Promise(resolve => server.close(resolve)); } };
+  return { base, server, getState: () => structuredClone(state), getRequests:()=>structuredClone(requests), close: async () => { await saveQueue; await new Promise(resolve => server.close(resolve)); } };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

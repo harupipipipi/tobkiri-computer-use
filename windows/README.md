@@ -88,6 +88,11 @@ semantic scroll、前面 scroll / drag、フォーカス／カーソル復元、
 全239件のpytestも通過しています。Cua 0.28.2がDPI拡大時に付加するWGCの黒余白は、破棄領域が
 実際に黒であることを確認した場合だけ除去し、UIA・画像入力座標はそれぞれの座標系へ変換します。
 
+2026-10-08の再検証では全250件のpytestが成功しました。前面配送を許可しない実機試験も
+10項目成功（前面フォールバック2項目はskip）し、背景click/type/UIA scrollと
+前面窓・物理マウスの保持を再確認しました。pixel scrollとbackground dragは拒否結果です。
+実機スクリプトはJSONレポートと同じフォルダに操作前後のPNGも保存します。
+
 ## 仮想デスクトップと仮想ディスプレイ
 
 `scripts/virtual_desktop_acceptance_windows.py` は、既に存在する別の仮想デスクトップへ fixture だけを

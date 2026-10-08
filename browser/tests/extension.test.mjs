@@ -22,7 +22,7 @@ function fakeChrome(config) {
   alarms:{async create(){},onAlarm:event()},
   action:{async setBadgeText(){},async setBadgeBackgroundColor(){}},
   windows:{async getAll(){return [{id:1,focused:true,incognito:false}];}},
-  tabs:{onRemoved:event(),
+  tabs:{onRemoved:event(),onActivated:event(),
    async get(id){if(!tabs.has(Number(id)))throw new Error('No such tab');return {...tabs.get(Number(id))};},
    async query(q){return [...tabs.values()].filter(t=>(q.active===undefined||t.active===q.active)&&(q.groupId===undefined||t.groupId===q.groupId)).map(t=>({...t}));},
    async create(p){assert.equal(p.active,false,'Production code must explicitly create inactive tabs');if(p.active)activationCalls.push(p);const t={id:nextTab++,windowId:p.windowId,url:p.url,title:'AI tab',active:false,incognito:false,groupId:-1,autoDiscardable:true};tabs.set(t.id,t);return {...t};},
@@ -130,6 +130,32 @@ test('extension permission and dispatch integration (MOCK native Chrome APIs)',a
  });
  await t.test('eval evaluates in the MAIN world (no isolated contextId)',async()=>{const r=await tool('browser_eval',{tabId:w.tabId,expression:'window.answer=42'});assert.equal(r.type,'object');const call=fake.cdpCalls.filter(c=>c.method==='Runtime.evaluate').at(-1);assert.equal(call.params.expression,'window.answer=42');assert.equal(call.params.contextId,undefined,'main-world eval must not pass an isolated-world contextId');assert.equal(call.params.returnByValue,true);});
  await t.test('cdp passes method and params through to the granted tab',async()=>{await tool('browser_cdp',{tabId:w.tabId,method:'Page.captureScreenshot',params:{format:'jpeg'}});assert.ok(fake.cdpCalls.some(c=>c.method==='Page.captureScreenshot'&&c.params.format==='jpeg'));});
+ await t.test('network tools preserve exact grants, ownership, pause and active-tab guards',async()=>{
+  await assert.rejects(tool('browser_network_start',{tabId:1}),/NOT_GRANTED/);
+  await assert.rejects(tool('browser_network_start',{tabId:w.tabId},second),/NOT_GRANTED/);
+  await tool('browser_network_start',{tabId:w.tabId});
+  const emit=chrome.debugger.onEvent.emit;
+  emit({tabId:w.tabId},'Network.requestWillBeSent',{requestId:'fixture-r',request:{url:'https://example.org/api',method:'GET',headers:{Cookie:'private'}}});
+  await new Promise(r=>setTimeout(r,10));
+  assert.equal((await tool('browser_network_read',{tabId:w.tabId})).entries[0].headers.Cookie,'[redacted]');
+  await assert.rejects(tool('browser_network_read',{tabId:w.tabId},second),/NOT_GRANTED/);
+  await tool('browser_network_routes',{tabId:w.tabId,rules:[{urlPattern:'https://example.org/*',action:'fulfill',body:'mock'}]});
+  emit({tabId:w.tabId},'Fetch.requestPaused',{requestId:'paused',request:{url:'https://example.org/api',method:'GET'}});
+  await new Promise(r=>setTimeout(r,10));assert.ok(fake.cdpCalls.some(c=>c.method==='Fetch.fulfillRequest'&&c.params.requestId==='paused'));
+  fake.tabs.get(w.tabId).active=true;
+  await assert.rejects(tool('browser_network_routes',{tabId:w.tabId,rules:[]}),/HUMAN_ACTIVE_TAB/);
+  chrome.tabs.onActivated.emit({tabId:w.tabId});await new Promise(r=>setTimeout(r,10));
+  assert.ok(!fake.debuggers.has(w.tabId),'human activation releases debugger and paused requests');
+  fake.tabs.get(w.tabId).active=false;
+  await assert.rejects(tool('browser_network_read',{tabId:w.tabId}),/NETWORK_NOT_STARTED/);
+  await tool('browser_network_start',{tabId:w.tabId});
+  await ui({type:'workspace-pause',workspaceId:w.workspaceId});
+  await assert.rejects(tool('browser_network_read',{tabId:w.tabId}),/WORKSPACE_PAUSED/);
+  await ui({type:'workspace-pause',workspaceId:w.workspaceId});
+  await assert.rejects(tool('browser_network_read',{tabId:w.tabId}),/NETWORK_NOT_STARTED/);
+  await tool('browser_network_start',{tabId:w.tabId});
+  assert.equal((await tool('browser_network_stop',{tabId:w.tabId})).logsCleared,true);
+ });
  await t.test('screenshot escalates hidden-tab capture: plain -> beyondViewport -> screencast',async()=>{
   const r1=await tool('browser_screenshot',{tabId:w.tabId,format:'png'});
   assert.equal(r1.image.mimeType,'image/png');

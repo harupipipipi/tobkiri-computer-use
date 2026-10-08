@@ -12,11 +12,12 @@ import { startBridge } from '../../../browser/src/bridge.mjs';
 import { request } from '../../../browser/src/config.mjs';
 import { defaults } from '../../../companion/src/config.js';
 import { Client } from '../../tests/client.mjs';
+import { verifyNetwork } from './network-acceptance.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const { values } = parseArgs({ options: { browser: { type: 'string', default: 'chrome' } } });
+const { values } = parseArgs({ options: { browser: { type: 'string', default: 'chrome' }, network:{type:'boolean',default:false} } });
 assert.ok(['chromium', 'chrome', 'msedge'].includes(values.browser));
-const output = resolve(root, 'integration/artifacts/social-demo', values.browser);
+const output = resolve(root, values.network?'integration/artifacts/network-demo':'integration/artifacts/social-demo', values.browser);
 await mkdir(output, { recursive: true });
 const temp = await mkdtemp(resolve(output, 'run-'));
 let social, bridge, client, context;
@@ -112,6 +113,7 @@ try {
   assert.equal(await page.locator('button[data-kind="follow"][data-id="aoi"]').getAttribute('aria-pressed'), 'true');
   assert.equal(await page.locator('button[data-kind="like"][data-id="morning"]').getAttribute('aria-pressed'), 'true');
   pass('Reload restores both follows and both likes from the server');
+  if(values.network)await verifyNetwork({client,tabId,social,screenshot,pass});
   await client.tool('tobkiri_tabs_scroll', { tabId, deltaY: -10000, x: 700, y: 100 });
   const snapshot = await client.tool('tobkiri_tabs_snapshot', { tabId });
   const liked = snapshot.elements.find(e => e.name === '葵の投稿のいいねを取り消す'); assert.ok(liked);
