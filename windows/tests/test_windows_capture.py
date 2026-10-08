@@ -5,6 +5,7 @@ from PIL import Image
 from tobkiri_computer_use.computer import (
     _crop_black_padding,
     _normalize_windows_element_frame,
+    _normalize_windows_capture,
 )
 
 
@@ -36,6 +37,20 @@ def test_nonblack_discard_region_is_never_cropped():
     assert changed is False
     assert size == (120, 100)
     assert result == original
+
+
+def test_dpi_aware_app_keeps_full_image_but_maps_live_frame(monkeypatch):
+    import tobkiri_computer_use.computer as module
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    bounds = {"x": 20, "y": 30, "width": 800, "height": 600}
+    monkeypatch.setattr(module, "_win32_window_bounds", lambda hwnd: bounds)
+    original = png(1200, 900, 1200, 900)
+    result, metadata = _normalize_windows_capture(
+        original, {"x": 30, "y": 45, "width": 1200, "height": 900}, 42)
+    assert result == original
+    assert metadata["reason"] == "win32_dpi_frame_mapping"
+    assert metadata["coordinate_image_size"] == [1200, 900]
+    assert metadata["win32_window_bounds"] == bounds
 
 
 def test_uia_frame_is_mapped_from_driver_dpi_space_to_win32_pixels():

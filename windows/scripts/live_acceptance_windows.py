@@ -187,6 +187,7 @@ def main():
                 before_foreground = foreground_window()
                 before_cursor = cursor_position()
                 state = window.observe(max_dimension=900, max_elements=1000)
+                state.save(args.output.with_name(args.output.stem + "-before.png"))
                 report["observed_elements"] = [element.to_dict() for element in state.elements[:8]]
                 report["checks"]["occluded_capture"] = {
                     "passed": bool(state.image and state.frame
@@ -352,6 +353,7 @@ def main():
                     }
                 stale = window.observe()
                 fresh = window.observe()
+                fresh.save(args.output.with_name(args.output.stem + "-after.png"))
                 try:
                     window.click(stale.find("Increment"))
                     stale_result = {"passed": False, "error": None}

@@ -16,6 +16,7 @@ import uuid
 from PIL import Image
 from .consent import ConsentRequest, InputCoordinator, require_consent, requires_consent
 from .cursor import CursorFollower, RawCursorOwner, MOTION_PROFILES
+from .companion import CompanionPublisher
 from .geometry import Frame, segment_intersects_rect
 from .models import Element, Observation, Point
 from .transport import ComputerError, McpTransport, structured
@@ -27,7 +28,7 @@ class Computer:
     The complete upstream tool surface remains available through tool().
     window() and mouse() add bounded observations and safe coordinate handling.
     """
-    def __init__(self, *, command=None, transport=None, cursor_coordinates=None, approval_callback=None, cursor_follow_interval=0.1, cursor_profile="fast"):
+    def __init__(self, *, command=None, transport=None, cursor_coordinates=None, approval_callback=None, cursor_follow_interval=0.1, cursor_profile="fast", companion=None):
         if cursor_profile not in (None, *MOTION_PROFILES):
             raise ValueError("cursor_profile must be fast, normal, or None (native settings)")
         self.cursor_profile = cursor_profile
@@ -46,6 +47,7 @@ class Computer:
         self._history = {}
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tobkiri-mouse")
         self._closed = False
+        self._companion = CompanionPublisher(companion)
         self._cursors = CursorFollower(self, cursor_follow_interval)
         self._raw_views = {}
         self._raw_owners = {}
@@ -78,7 +80,9 @@ class Computer:
                                                     if browser_setup else "Explicit low-level foreground/desktop operation")
                     require_consent(self._approval_callback, request)
                     arguments = self._refresh_raw_input(name, arguments)
-                result = self.transport.call(name, arguments)
+                with self._companion.action(arguments.get("session"), name, arguments) as receipt:
+                    result = self.transport.call(name, arguments)
+                    receipt["result"] = result
                 self._follow_raw_cursor(name, arguments, result)
                 return result
             finally:
@@ -230,6 +234,10 @@ class Computer:
                 # cursor status carries the overlay error.
                 pass
 
+    def companion_status(self):
+        """Local renderer telemetry status; not evidence of input success."""
+        return self._companion.status()
+
     def cursor_status(self, *, pid=None, window_id=None):
         owners = list(self._raw_owners.values())
         owners.extend(a.owner for a in self._cursor_anchors())
@@ -303,6 +311,7 @@ class Computer:
             return
         self._pool.shutdown(wait=True, cancel_futures=False)
         self._cursors.close()
+        self._companion.close()
         self._closed = True
         for session in list(self._sessions):
             try:
@@ -333,7 +342,10 @@ class Window:
     def _call(self, name, **args):
         if self._closed or self.computer._closed:
             raise ComputerError("closed", "This window session is closed.")
-        return self.computer.transport.call(name, {"session": self.session, **args})
+        with self.computer._companion.action(self.session, name, args) as receipt:
+            result = self.computer.transport.call(name, {"session": self.session, **args})
+            receipt["result"] = result
+            return result
 
     def set_cursor_speed(self, profile="fast"):
         """Configure only this session's virtual overlay. Does not take focus.
@@ -720,6 +732,12 @@ class Window:
             if follow["phase"] != "following":
                 raise ComputerError("cursor_unavailable", "The window cursor cannot be shown in this geometry/Space.", details=follow)
             screen_x, screen_y = follow["screen_point"]
+            if self.computer._companion.enabled:
+                # The character renderer replaces the deliberately disabled native marker.
+                return {"expected_screen_point": [screen_x, screen_y], "reported_position": None,
+                        "position_matches": None, "error_points": None, "visual_state": None,
+                        "pixels_verified": False, "follow": follow,
+                        "companion": self.computer.companion_status()}
             state = structured(self._call("get_agent_cursor_state"))
             position = state.get("position", {})
             error = math.hypot(position.get("x", math.inf)-screen_x, position.get("y", math.inf)-screen_y)

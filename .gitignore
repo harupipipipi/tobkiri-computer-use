@@ -7,6 +7,11 @@ dist
 artifacts
 .DS_Store
 *.log
+node_modules/
+/companion/test-results/
+# Historical local demo artifacts; Browser Use is maintained in its own repo.
+/browser/
+/integration/
 .env
 .env.*
 !.env.example

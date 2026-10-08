@@ -209,6 +209,9 @@ class ReloadableServer:
 
 
 def main():
+    for stream in (sys.stdin, sys.stdout):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
         from .server import main as worker_main
         return worker_main()

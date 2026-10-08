@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'"
+    />
+    <title>Tobkiri — Cursor Studio</title>
+    <link rel="stylesheet" href="src/studio.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="#"
+        ><span class="brand-icon">t<span>•</span></span
+        ><span>tobkiri<small>CURSOR STUDIO</small></span></a
+      >
+      <div class="sidebar-label">YOUR LITTLE CO-WORKER</div>
+      <button class="nav active" data-section="studio">
+        <span>◈</span> キャラクター
+      </button>
+      <button class="nav" data-section="motion">
+        <span>↗</span> アニメーション <b data-motion-count>48</b>
+      </button>
+      <button class="nav" data-section="cursor">
+        <span>➚</span> カーソルを描く
+      </button>
+      <div class="sidebar-bottom">
+        <div class="tiny-avatar">✦</div>
+        <strong>画面の中に、小さな相棒。</strong>
+        <p>
+          はしる。考える。手を動かす。<br />あなたらしいカーソルをつくろう。
+        </p>
+        <span class="version">LOCAL WORKSPACE <i>v0.1</i></span>
+      </div>
+    </aside>
+    <main>
+      <header>
+        <div class="breadcrumb">Workspace <span>/</span> Character studio</div>
+        <div class="header-actions">
+          <span id="save-state">この端末に保存</span
+          ><button class="button subtle" id="import">↑ 読み込む</button
+          ><button class="button subtle" id="export">↓ 書き出す</button
+          ><input
+            type="file"
+            id="pack-file"
+            accept=".json,application/json"
+            hidden
+          />
+        </div>
+      </header>
+      <div class="page-title">
+        <div>
+          <div class="eyebrow">A LITTLE LIFE ON YOUR DESKTOP</div>
+          <h1>カーソルに、いのちを。</h1>
+          <p>あなたの操作に寄りそう、小さなキャラクターをつくろう。</p>
+        </div>
+        <button class="button primary" id="desktop-toggle">
+          <span>↗</span> デスクトップに出す
+        </button>
+      </div>
+      <div class="workspace">
+        <section class="preview-column">
+          <div class="stage-shell">
+            <div class="stage-toolbar">
+              <span><i class="live-dot"></i> PLAYGROUND</span>
+              <div>
+                <button class="pill active" id="auto-demo">おまかせ</button
+                ><button class="pill" id="interact">マウスであそぶ</button
+                ><button
+                  class="icon-button"
+                  id="pause"
+                  aria-label="プレビューを一時停止"
+                >
+                  Ⅱ
+                </button>
+              </div>
+            </div>
+            <div class="stage" id="stage">
+              <div class="stage-topline">
+                <span>mochi's little desktop</span
+                ><span>✦ &nbsp; make yourself at home</span>
+              </div>
+              <div class="mini-window notes">
+                <div class="window-bar">
+                  <i></i><i></i><i></i><span>今日のメモ</span>
+                </div>
+                <div class="note-body">
+                  <span class="note-eyebrow">A GOOD DAY TO CREATE</span>
+                  <h2>小さな一歩から。</h2>
+                  <div class="check"><span>✓</span> コーヒーをいれる</div>
+                  <div class="check"><span>✓</span> 新しいアイデアを探す</div>
+                  <div class="check">
+                    <span class="empty"></span> なにか、つくってみる
+                  </div>
+                  <div class="note-lines"></div>
+                </div>
+              </div>
+              <div class="mini-window music">
+                <div class="album">
+                  <div class="sun"></div>
+                  <div class="hill one"></div>
+                  <div class="hill two"></div>
+                  <span>slow<br />mornings.</span>
+                </div>
+                <strong>A little daydream</strong
+                ><small>the desktop sessions</small>
+                <div class="music-controls">
+                  <span>⏮</span><span class="music-play">▶</span><span>⏭</span>
+                </div>
+              </div>
+              <div class="folder"><span>▰</span><small>ideas</small></div>
+              <div class="stage-bottomline">
+                <span>✳ 自分だけの相棒を、自由につくろう。</span
+                ><span id="fps">60 FPS</span>
+              </div>
+              <canvas
+                id="playground"
+                aria-label="キャラクターのアニメーションプレビュー"
+              ></canvas>
+              <div class="character-caption">
+                <span id="character-name">Mochi</span
+                ><small id="action-label">ひと休み</small>
+              </div>
+            </div>
+            <div class="stage-footer">
+              <span
+                ><i class="status-dot"></i
+                ><span id="connection">ブラウザプレビュー</span></span
+              ><span id="stage-hint">しぐさを、おまかせ再生中</span>
+            </div>
+          </div>
+          <section class="motion-panel" id="motion-panel">
+            <div class="section-heading">
+              <div>
+                <h2>しぐさのライブラリ <span data-motion-count>48</span></h2>
+                <p>クリックすると、すぐに動き出します。</p>
+              </div>
+              <select id="motion-filter" aria-label="アニメーションの種類">
+                <option value="all">すべてのしぐさ</option>
+                <option value="work">おしごと</option>
+                <option value="life">日常</option>
+                <option value="move">うごき</option>
+              </select>
+            </div>
+            <div class="motion-grid" id="motion-grid"></div>
+          </section>
+          <div class="integration-note">
+            <span>⌘</span>
+            <div>
+              <strong>Computer Use といっしょに。</strong>
+              <p id="integration-copy">
+                デスクトップ版では、クリック・文字入力・スクロールに合わせて相棒が動きます。
+              </p>
+            </div>
+            <span class="local-badge">LOCAL ONLY</span>
+          </div>
+        </section>
+        <aside class="inspector">
+          <div class="inspector-title">
+            <h2>相棒をカスタマイズ</h2>
+            <span>✧</span>
+          </div>
+          <label class="field display-field"
+            >表示
+            <select id="displayMode">
+              <option value="pet">petだけ（カーソル非表示）</option>
+              <option value="both">カーソル ＋ pet</option>
+            </select>
+          </label>
+          <div class="tabs" role="tablist">
+            <button
+              class="active"
+              role="tab"
+              aria-selected="true"
+              data-tab="look"
+            >
+              見た目</button
+            ><button role="tab" aria-selected="false" data-tab="motion">
+              動き</button
+            ><button role="tab" aria-selected="false" data-tab="cursor">
+              カーソル
+            </button>
+          </div>
+          <div class="tab-content" id="tab-look">
+            <label class="field"
+              >なまえ<input id="name" maxlength="32" value="Mochi"
+            /></label>
+            <div class="field">
+              ベースキャラクター
+              <div class="presets" id="presets"></div>
+            </div>
+            <div class="section-rule"></div>
+            <div class="color-row">
+              <label>からだの色</label>
+              <div>
+                <span id="color-value">#7764E8</span
+                ><input
+                  type="color"
+                  id="color"
+                  value="#7764e8"
+                  aria-label="からだの色"
+                />
+              </div>
+            </div>
+            <div class="swatches" id="swatches"></div>
+            <div class="color-row">
+              <label for="accent">アクセント</label>
+              <div>
+                <span id="accent-value">#B9F373</span
+                ><input type="color" id="accent" value="#b9f373" />
+              </div>
+            </div>
+            <label class="range-field"
+              >大きさ <output for="size" id="size-value">100%</output
+              ><input id="size" type="range" min="45" max="180" value="100"
+            /></label>
+            <label class="range-field"
+              >線の太さ <output for="weight" id="weight-value">9</output
+              ><input id="weight" type="range" min="4" max="16" value="9"
+            /></label>
+            <label class="range-field"
+              >あたまの大きさ <output for="head" id="head-value">17</output
+              ><input id="head" type="range" min="10" max="25" value="17"
+            /></label>
+            <div class="section-rule"></div>
+            <label class="field"
+              >アクセサリー<select id="accessory">
+                <option value="scarf">風になびくスカーフ</option>
+                <option value="antenna">小さなアンテナ</option>
+                <option value="none">なし / シンプルな棒人間</option>
+              </select></label
+            >
+            <label class="toggle-row"
+              >表情をつける<input
+                type="checkbox"
+                id="eyes"
+                checked /><span></span
+            ></label>
+            <label class="toggle-row"
+              >きらっと残る軌跡<input
+                type="checkbox"
+                id="trail"
+                checked /><span></span
+            ></label>
+          </div>
+          <div class="tab-content" id="tab-motion" hidden>
+            <label class="range-field"
+              >アニメーションの速さ <output id="speed-value">1×</output
+              ><input
+                id="speed"
+                type="range"
+                min=".3"
+                max="2"
+                step=".1"
+                value="1"
+            /></label>
+            <label class="field"
+              >デスクトップでの動き<select id="mode">
+                <option value="computer">
+                  Computer Use の操作についていく
+                </option>
+                <option value="pointer">自分のマウスについていく</option>
+              </select></label
+            >
+            <label class="toggle-row"
+              >動きを控えめにする<input
+                type="checkbox"
+                id="reducedMotion" /><span></span
+            ></label>
+            <div class="section-rule"></div>
+            <h3>自作アニメーション</h3>
+            <p class="helper">
+              横一列に並べた透過PNGの連番画像で、選んだしぐさを置き換えられます。
+            </p>
+            <label class="field"
+              >置き換えるしぐさ<select id="sprite-action"></select
+            ></label>
+            <div class="two-fields">
+              <label class="field"
+                >フレーム数<input
+                  type="number"
+                  id="sprite-frames"
+                  min="1"
+                  max="64"
+                  value="8" /></label
+              ><label class="field"
+                >FPS<input
+                  type="number"
+                  id="sprite-fps"
+                  min="1"
+                  max="60"
+                  value="12"
+              /></label>
+            </div>
+            <button class="button full" id="sprite-import">
+              ＋ 連番PNGを取り込む</button
+            ><input
+              type="file"
+              id="sprite-file"
+              accept="image/png"
+              hidden
+            /><button class="text-button" id="sprite-reset">
+              このしぐさを元に戻す
+            </button>
+            <p class="helper" id="sprite-state">標準のしぐさを使用中</p>
+            <div class="tip">
+              ✧
+              JSONファイルでは関節ごとのポーズも定義できます。つくった相棒は画像もまとめて書き出せます。
+            </div>
+          </div>
+          <div class="tab-content" id="tab-cursor" hidden>
+            <label class="field"
+              >カーソルのかたち<select id="cursor">
+                <option value="arrow">クラシックな矢印</option>
+                <option value="star">小さな星</option>
+                <option value="ring">まるい照準</option>
+                <option value="custom">自分で描く / PNG</option>
+              </select></label
+            >
+            <div class="color-row">
+              <label for="cursorColor">カーソルの色</label
+              ><input id="cursorColor" type="color" value="#302c43" />
+            </div>
+            <div class="section-rule"></div>
+            <h3>32 × 32 の小さなキャンバス</h3>
+            <p class="helper">
+              ドラッグで描けます。Shiftを押しながら消す。描いた絵がそのままカーソルに。
+            </p>
+            <canvas
+              id="cursor-drawing"
+              width="256"
+              height="256"
+              aria-label="カスタムカーソルを描く"
+            ></canvas>
+            <div class="draw-actions">
+              <button class="button" id="cursor-clear">クリア</button
+              ><button class="button" id="cursor-import">PNGを取り込む</button
+              ><input type="file" id="cursor-file" accept="image/png" hidden />
+            </div>
+            <div class="two-fields">
+              <label class="field"
+                >クリック位置 X<input
+                  id="hotspot-x"
+                  type="number"
+                  min="0"
+                  max="31"
+                  value="0" /></label
+              ><label class="field"
+                >クリック位置 Y<input
+                  id="hotspot-y"
+                  type="number"
+                  min="0"
+                  max="31"
+                  value="0"
+              /></label>
+            </div>
+            <div class="tip">
+              カーソルの先端が操作位置になります。キャラクターの動きは入力座標に影響しません。
+            </div>
+          </div>
+          <div class="inspector-bottom">
+            <span class="mini-sparkle">✦</span
+            ><span>つくるのは、あなただけの相棒。</span
+            ><button class="text-button" id="reset">リセット</button>
+          </div>
+        </aside>
+      </div>
+      <footer>
+        <span>DESIGNED TO FEEL ALIVE.</span
+        ><span
+          >Tobkiri Computer Use
+          <span class="footer-dot">•</span>
+          キャラクターは表示専用。操作は既存の入力経路を使用します。</span
+        >
+      </footer>
+    </main>
+    <div class="toast" role="status" id="toast" hidden></div>
+    <script type="module" src="src/studio.js"></script>
+  </body>
+</html>

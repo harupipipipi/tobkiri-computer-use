@@ -9,6 +9,9 @@ Cua Driverを基盤に、PythonとMCPからアプリを操作するComputer Use�
 - 画像のズーム、赤いクリック履歴、入力を送らず確認できるクリック前プレビュー。
 - 複数の名前付き仮想カーソル。物理マウスは1つの共有入力デバイスです。
 - Cua標準ツールの公開と、MCPクライアントを終了せず更新する仕組み。
+- [Cursor Studio](companion/README.md)：48種類のしぐさで操作についてくるキャラクター。
+  棒人間の見た目、手描きカーソル、自作PNGアニメーションを編集できます。
+  「petだけ」と「カーソル＋pet」を切り替えられます。
 
 通常の仮想入力は追加確認なしで進め、物理マウス・キーボードや前面フォーカスを
 借りる操作は承認を通します。ログインや重要な操作はホスト側の確認ルールに従います。
@@ -32,6 +35,10 @@ README、エージェント用の手順は各パッケージの `skill/SKILL.md`
 
 ## 構成
 
+キャラクターの編集・デスクトップ表示は `companion/` で `npm ci` → `npm start`。
+Pythonは `Computer(companion=True)`、MCPは `TOBKIRI_COMPANION=1` で接続します。
+詳しくは [Cursor Studio の起動手順](companion/README.md) を参照してください。
+
 ```text
 mac/
   src/tobkiri_computer_use/  Python API・MCP・Skill
@@ -46,6 +53,7 @@ windows/
   scripts/                  WinForms fixture と実機受け入れ試験
   tests/                    単体テスト
   docs/                     Windows比較・隔離実験
+companion/                  キャラクター編集・ネイティブ操作の描画
 ```
 
 ## 検証状況
@@ -59,6 +67,8 @@ Windows版は同一WinForms fixtureの現行デスクトップ試験で標準Com
 バックグラウンドUIA経路ではフォーカスと物理カーソルを維持しました。別のWindows仮想
 デスクトップは画像取得までで、入力配送は保証しません。詳細は
 [Windows比較・隔離実験](windows/docs/WINDOWS_PARITY.md)を参照してください。
+独立したComputer MCPと専用fixtureでの直近の結果は
+[Windows検証記録](windows/docs/COMPUTER_VALIDATION.md)に記載しています。
 
 実機の画像・生ログ・個人用設定・ビルド済みアプリはリポジトリに含めていません。
 文書内の`artifacts/`はローカル試験時の保存先です。
