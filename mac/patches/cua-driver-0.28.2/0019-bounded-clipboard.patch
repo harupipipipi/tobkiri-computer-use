@@ -1,0 +1,260 @@
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/clipboard.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/clipboard.rs
+@@ -1,12 +1,13 @@
+ //! Cross-platform clipboard tools and platform backend seam.
+ 
+-use std::sync::Arc;
++use std::{sync::Arc, time::Duration};
+ 
+ use async_trait::async_trait;
+ use cua_driver_contract::{
+     ClipboardReadInput, ClipboardReadOutput, ClipboardWriteInput, ClipboardWriteOutput,
+ };
+ use serde_json::Value;
++use tokio::sync::Semaphore;
+ 
+ use crate::{
+     protocol::ToolResult,
+@@ -23,10 +24,60 @@
+ }
+ 
+ pub fn register_clipboard_tools(registry: &mut ToolRegistry, backend: Arc<dyn ClipboardBackend>) {
++    let clipboard = ClipboardAccess::new(backend);
+     registry.register(Box::new(ClipboardReadTool {
+-        backend: backend.clone(),
++        clipboard: clipboard.clone(),
+     }));
+-    registry.register(Box::new(ClipboardWriteTool { backend }));
++    registry.register(Box::new(ClipboardWriteTool { clipboard }));
++}
++
++#[derive(Clone)]
++struct ClipboardAccess {
++    backend: Arc<dyn ClipboardBackend>,
++    permit: Arc<Semaphore>,
++    timeout: Duration,
++}
++
++impl ClipboardAccess {
++    fn new(backend: Arc<dyn ClipboardBackend>) -> Self {
++        Self {
++            backend,
++            permit: Arc::new(Semaphore::new(1)),
++            timeout: Duration::from_secs(5),
++        }
++    }
++
++    async fn run<T: Send + 'static>(
++        &self,
++        operation: &str,
++        task: impl FnOnce(&dyn ClipboardBackend) -> Result<T, String> + Send + 'static,
++    ) -> Result<T, ToolResult> {
++        let permit = self.permit.clone().try_acquire_owned().map_err(|_| {
++            unavailable(
++                operation,
++                "a previous operation is still running; no request was sent",
++            )
++        })?;
++        let backend = self.backend.clone();
++        let mut worker = tokio::task::spawn_blocking(move || {
++            let _permit = permit;
++            task(backend.as_ref())
++        });
++        match tokio::time::timeout(self.timeout, &mut worker).await {
++            Ok(Ok(Ok(value))) => Ok(value),
++            Ok(Ok(Err(error))) => Err(unavailable(operation, error)),
++            Ok(Err(error)) => Err(unavailable(operation, format!("worker failed: {error}"))),
++            Err(_) => {
++                // Aborting only cancels work that has not yet started. A running
++                // operating-system request retains the permit until it returns.
++                worker.abort();
++                Err(unavailable(
++                    operation,
++                    "the system clipboard did not respond before the deadline; the outcome is unknown",
++                ))
++            }
++        }
++    }
+ }
+ 
+ fn contract_def(name: &str) -> ToolDef {
+@@ -56,7 +107,7 @@
+ }
+ 
+ pub struct ClipboardReadTool {
+-    backend: Arc<dyn ClipboardBackend>,
++    clipboard: ClipboardAccess,
+ }
+ 
+ static READ_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+@@ -72,22 +123,22 @@
+             Ok(input) => input,
+             Err(result) => return result,
+         };
+-        let backend = self.backend.clone();
+-        let result = tokio::task::spawn_blocking(move || {
+-            let types = normalize_types(backend.available_formats()?);
+-            let text = if input.include_text {
+-                backend.read_text()?
+-            } else {
+-                None
+-            };
+-            Ok::<_, String>((types, text))
+-        })
+-        .await;
++        let result = self
++            .clipboard
++            .run("read", move |backend| {
++                let types = normalize_types(backend.available_formats()?);
++                let text = if input.include_text {
++                    backend.read_text()?
++                } else {
++                    None
++                };
++                Ok::<_, String>((types, text))
++            })
++            .await;
+ 
+         let (types, text) = match result {
+-            Ok(Ok(value)) => value,
+-            Ok(Err(error)) => return unavailable("read", error),
+-            Err(error) => return unavailable("read", format!("worker failed: {error}")),
++            Ok(value) => value,
++            Err(result) => return result,
+         };
+         let output = ClipboardReadOutput {
+             supported: true,
+@@ -110,7 +161,7 @@
+ }
+ 
+ pub struct ClipboardWriteTool {
+-    backend: Arc<dyn ClipboardBackend>,
++    clipboard: ClipboardAccess,
+ }
+ 
+ static WRITE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+@@ -135,29 +186,29 @@
+             );
+         }
+ 
+-        let backend = self.backend.clone();
+-        let result = tokio::task::spawn_blocking(move || {
+-            let written_type = if let Some(text) = input.text {
+-                backend.write_text(text)?;
+-                "text"
+-            } else if let Some(path) = input.image_path {
+-                backend.write_image(&path)?;
+-                "image"
+-            } else if let Some(path) = input.file_path {
+-                backend.write_file_url(&path)?;
+-                "file_url"
+-            } else {
+-                unreachable!("exactly one clipboard value was checked above")
+-            };
+-            let types = normalize_types(backend.available_formats()?);
+-            Ok::<_, String>((written_type, types))
+-        })
+-        .await;
++        let result = self
++            .clipboard
++            .run("write", move |backend| {
++                let written_type = if let Some(text) = input.text {
++                    backend.write_text(text)?;
++                    "text"
++                } else if let Some(path) = input.image_path {
++                    backend.write_image(&path)?;
++                    "image"
++                } else if let Some(path) = input.file_path {
++                    backend.write_file_url(&path)?;
++                    "file_url"
++                } else {
++                    unreachable!("exactly one clipboard value was checked above")
++                };
++                let types = normalize_types(backend.available_formats()?);
++                Ok::<_, String>((written_type, types))
++            })
++            .await;
+ 
+         let (written_type, types) = match result {
+-            Ok(Ok(value)) => value,
+-            Ok(Err(error)) => return unavailable("write", error),
+-            Err(error) => return unavailable("write", format!("worker failed: {error}")),
++            Ok(value) => value,
++            Err(result) => return result,
+         };
+         let output = ClipboardWriteOutput {
+             supported: true,
+@@ -246,9 +297,9 @@
+ 
+     #[tokio::test]
+     async fn text_round_trip_returns_types_and_privacy_metadata() {
+-        let backend: Arc<dyn ClipboardBackend> = Arc::new(FakeClipboard::default());
++        let clipboard = ClipboardAccess::new(Arc::new(FakeClipboard::default()));
+         let write = ClipboardWriteTool {
+-            backend: backend.clone(),
++            clipboard: clipboard.clone(),
+         }
+         .invoke(serde_json::json!({"text": "private value"}))
+         .await;
+@@ -258,7 +309,7 @@
+             serde_json::json!(["text/plain"])
+         );
+ 
+-        let read = ClipboardReadTool { backend }
++        let read = ClipboardReadTool { clipboard }
+             .invoke(serde_json::json!({"include_text": true}))
+             .await;
+         let output = read.structured_content.unwrap();
+@@ -274,7 +325,7 @@
+             serde_json::json!({"text": "x", "file_path": "/tmp/x"}),
+         ] {
+             let result = ClipboardWriteTool {
+-                backend: Arc::new(FakeClipboard::default()),
++                clipboard: ClipboardAccess::new(Arc::new(FakeClipboard::default())),
+             }
+             .invoke(args)
+             .await;
+@@ -285,7 +336,7 @@
+     #[tokio::test]
+     async fn unavailable_backend_returns_an_explicit_content_free_status() {
+         let result = ClipboardReadTool {
+-            backend: Arc::new(UnavailableClipboard),
++            clipboard: ClipboardAccess::new(Arc::new(UnavailableClipboard)),
+         }
+         .invoke(serde_json::json!({}))
+         .await;
+@@ -300,4 +351,33 @@
+             .find("no display clipboard provider")
+             .is_none());
+     }
+-}
++
++    #[tokio::test]
++    async fn timed_out_write_does_not_queue_another_clipboard_operation() {
++        let mut clipboard = ClipboardAccess::new(Arc::new(FakeClipboard::default()));
++        clipboard.timeout = Duration::from_millis(50);
++        let (release, wait) = std::sync::mpsc::channel();
++        let (started, entered) = tokio::sync::oneshot::channel();
++        let running = clipboard.clone();
++        let delayed = tokio::spawn(async move {
++            running
++                .run("write", move |_| {
++                    let _ = started.send(());
++                    let _ = wait.recv();
++                    Ok(())
++                })
++                .await
++        });
++        entered.await.expect("worker started");
++        assert_eq!(delayed.await.unwrap().unwrap_err().is_error, Some(true));
++        let blocked: Result<(), _> = clipboard.run("read", |_| panic!("must not queue")).await;
++        assert_eq!(blocked.unwrap_err().is_error, Some(true));
++        assert_eq!(clipboard.permit.available_permits(), 0);
++        release.send(()).unwrap();
++        assert!(
++            tokio::time::timeout(Duration::from_secs(1), clipboard.permit.acquire())
++                .await
++                .is_ok()
++        );
++    }
++}

@@ -96,6 +96,37 @@ def test_translation_refreshes_native_frame_without_changing_local_pixels(rig, c
     assert any(n == "get_window_state" and a.get("include_accessibility_tree") is False for n, a in t.calls)
 
 
+@pytest.mark.parametrize("layout_changed", [False, True])
+def test_observed_click_refreshes_only_a_pure_translation(rig, clock, layout_changed):
+    c, t, w, s = setup(rig)
+    t.list_tools = lambda: [{"name": "tobkiri_click_observed"}]
+    original = t.call
+    clicks = []
+
+    def call(name, args=None):
+        if name != "tobkiri_click_observed":
+            return original(name, args)
+        clicks.append(args)
+        if len(clicks) == 1:
+            t.bounds["x"] += 100
+            if layout_changed:
+                t.element_shift += 10
+        return {"structuredContent": {"effect": "unverifiable"}}
+
+    t.call = call
+    result = w.timeline([ClickStep(0, s.point(50, 50)), ClickStep(.2, s.point(60, 50))],
+                        stop_event=clock)
+    assert clicks[0]["snapshot_id"] == s.driver_snapshot_id
+    assert clicks[0]["pid"] == 7 and clicks[0]["window_id"] == 10
+    assert not any(name == "click" for name, _ in t.calls)
+    if layout_changed:
+        assert len(clicks) == 1 and result.error["code"] == "stale_geometry"
+    else:
+        assert len(clicks) == 2 and result.status == "completed"
+        assert clicks[1]["snapshot_id"] != clicks[0]["snapshot_id"]
+        assert (clicks[1]["x"], clicks[1]["y"]) == (60, 50)
+
+
 def test_slow_driver_does_not_emit_catchup_burst(rig, clock):
     c, t, w, s = setup(rig); original = t.call
     def call(name, args=None):

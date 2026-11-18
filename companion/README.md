@@ -89,9 +89,27 @@ Studioから入力命令を実行するAPIはありません。元の入力API�
 MCPの `tobkiri_act` とPythonのWindow APIは同じ経路です。
 観測済みの対象を持つ低レベルCua呼び出しも対応します。
 ブラウザのCDP専用API、未観測の対象、任意の他アプリの操作はこのUDP通知の対象外です。
-起動環境の `TOBKIRI_CURSOR_PACK` にJSONの絶対パスを指定すると、見た目の設定だけを
-そのファイルへ書き出します。Browser Useなどで同じ見た目を使いたい場合の任意機能です。
-入力命令やタブ情報は含めず、Browserの起動やMCP接続は行いません。
+
+## Tobkiri Tabs とカーソルを共有する
+
+Computer Use の Cursor Studio を開き、キャラクターやカーソルを編集します。Studio は起動・保存時に
+`~/.tobkiri-tabs/cursor-pack.json` に設定を書き出します。標準の設定先で接続した Tabs は次の操作から
+その設定を読みます。`browser_status` の `cursor.renderer` が `cursor-studio` なら読み込み済みです。
+デスクトップ側の表示には `Computer(companion=True)` または `TOBKIRI_COMPANION=1` を使います。
+
+Studio に保存済みの設定がなければ、初回起動時に共有 JSON の見た目を取り込みます。Studio の設定がある
+場合はそちらを使います。共有先に別の設定がある場合は、初回の書き換え前に `.before-studio` を付けて保存します。
+別の場所にある設定は Studio の「読み込む」で引き継げます。書き出せなかった場合は Studio に表示されます。
+
+Chrome・Edge・Vivaldi を同時に使い分けるときは、ブラウザのプロファイルごとに Tabs の設定ファイル、
+ポート、MCP 登録名を分けてペアリングします。たとえば Edge 用の設定を追加するときは Tabs の
+リポジトリで `node src/cli.mjs setup --config "$HOME/.tobkiri-tabs/edge/config.json" --port 17654` を実行します。
+各 MCP 登録の環境変数 `TOBKIRI_CURSOR_PACK` に同じ共有 JSON の絶対パスを指定すると、すべての
+プロファイルで同じ見た目を使えます。標準の共有先を変更する場合は、Studio の起動環境にも
+`TOBKIRI_CURSOR_PACK` を設定します。 [Tobkiri Tabs の接続手順](https://github.com/harupipipipi/tobkiri-browser-use#導入)
+
+共有するのはカーソルの見た目とアニメーションの設定です。デスクトップはウィンドウの操作位置に、
+Tabs は操作対象タブのページ内に描画します。
 
 ## できること
 
@@ -118,17 +136,16 @@ MCPの `tobkiri_act` とPythonのWindow APIは同じ経路です。
 描画は `requestAnimationFrame` を使い、リフレッシュレートに合わせて更新します。
 身体の追従とポーズ遷移は時間差で補間します。カーソル表示時の先端は通知された座標に
 そのまま描き、身体だけを滑らかに追従させます。実測FPSはプレビューに表示します。
-操作前にキャラが対象位置へ移動し、ポーズを取ってから入力します。
-描画側が応答しない場合は最大60ms、応答した場合は最大1.26秒だけ待ちます。
-タイムアウトしても入力を再送せず、既存の入力処理を一度だけ実行します。
-`TOBKIRI_COMPANION_SYNC=0` で到着待ちを無効にできます。
+通常は描画と入力を並行して進め、入力開始の通知でキャラをその座標に合わせます。
+`TOBKIRI_COMPANION_SYNC=1` を指定したときだけ、入力前にキャラの到着を待ちます。
+応答がない場合は最大60ms、応答した場合は最大1.26秒待ちます。
+`companion_status()` の `sync_enabled` でこの設定を確認できます。
 入力アニメーションは試行を表し、一文字ごとの入力や成功を証明するものではありません。
 
 ## 自分のキャラクターを作る
 
 設定画面上部の「表示」で **petだけ（カーソル非表示）** と **カーソル＋pet** を
-切り替えます。標準はpetだけです。JSONを書き出す `TOBKIRI_CURSOR_PACK` 起動では、
-初期設定がカーソル＋petになります。petだけにすると矢印・クリックの輪・カーソルの軌跡が消え、
+切り替えます。共有時の初期設定はカーソル＋petです。petだけにすると矢印・クリックの輪・カーソルの軌跡が消え、
 キャラクターの動きと実際の入力位置は維持されます。色や自作カーソルは保持します。
 JSONでは `displayMode: "pet"` / `"both"`。既存の設定にこの項目がなければpetだけになります。
 

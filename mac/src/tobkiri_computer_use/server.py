@@ -11,6 +11,7 @@ import threading
 
 from jsonschema import Draft202012Validator
 from .computer import Computer
+from .cursor_themes import theme_arguments
 from .consent import TerminalConsent, MacOSDialogConsent
 from .browser import browser_report
 from .transport import ComputerError
@@ -65,7 +66,9 @@ HELPERS = [
                 "delivery_mode": {"enum": ["background", "foreground"], "default": "background"},
                 "fallback_reason": {"type": "string", "minLength": 1, "maxLength": 2000,
                                     "description": "Why background input is insufficient. This is a request, NOT user approval."},
-                "expect": EXPECT, "include_image": {"type": "boolean", "default": True}}, ("pid", "window_id", "action")),
+                "expect": EXPECT, "include_image": {"type": "boolean", "default": True},
+                "readback": {"enum": ["same", "ax"], "default": "same",
+                             "description": "ax returns current accessibility state without capturing an image. Observe a new image before using pixel input."}}, ("pid", "window_id", "action")),
     descriptor("tobkiri_zoom", "Crop the exact observed image, keeping a per-crop transform. Click with this zoom_id + observation_id; another window's zoom cannot overwrite it.",
                {**TARGET, **OBSERVATION, "region": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
                  "description": "[left, top, right, bottom] in source screenshot pixels; clipped to image bounds."},
@@ -76,9 +79,12 @@ HELPERS = [
                            "description": "Detail crop radius in original screenshot pixels."},
                 "scale": {"type": "number", "exclusiveMinimum": 0, "maximum": 8, "default": 3}},
                ("pid", "window_id", "observation_id")),
-    descriptor("tobkiri_cursor", "Move a named virtual overlay, read status, or set speed. Helpers default to fast (1ms glide, no dwell), normal restores Cua motion. The overlay follows its window; hardware is never moved. Resize requires fresh observation.",
-               {**TARGET, **OBSERVATION, "action": {"enum": ["move", "status", "speed"], "default": "move"},
+    descriptor("tobkiri_cursor", "Move a named virtual overlay, read follow status/native theme state, set speed, or select an installed theme. cua.default selects Cua artwork on either OS; custom themes require trusted host installation. Theme changes queue rendering; read state for native fallback, not pixel proof. Helpers default to fast (1ms glide, no dwell). The overlay follows its exact window; hardware is never moved. Resize requires fresh observation.",
+               {**TARGET, **OBSERVATION, "action": {"enum": ["move", "status", "speed", "theme", "state"], "default": "move"},
                 "profile": {"enum": ["fast", "normal"], "default": "fast"},
+                "theme_id": {"type": "string", "minLength": 1, "maxLength": 200,
+                             "description": "Installed dotted theme ID: cua.default, tobkiri.arrow, tobkiri.stickman, or another installed theme. No paths or inline artwork."},
+                "reduced_motion": {"enum": ["auto", "on", "off"], "default": "auto"},
                 "point": POINT, "element_id": {"type": "integer"}}, ("pid", "window_id")),
     descriptor("tobkiri_timeline", "Schedule a bounded sequence of background clicks on a static, observed window using a monotonic clock. Optional named cursors share the window. Checks geometry/visibility/sibling overlap per event, captures again at the end. Use for piano keys or repeated fixed controls; split before scrolling/navigation/layout changes. Stops on refusal, timeout or cancellation. Excess lateness stops by default; explicit stretch mode shifts future deadlines and reports drift. Never emits a catch-up burst. Timings describe dispatch, not measured sound onset. Never uses physical input.",
                {**TARGET, **OBSERVATION,
@@ -246,7 +252,14 @@ class ToolService:
                     target = s.point(*args["point"]) if "point" in args else s.element(args["element_id"])
                     preview = s.preview(target, **options)
                 return content(preview.to_dict(), preview.image_contents())
+            if name == "tobkiri_cursor" and args.get("action") == "theme":
+                # Reject missing IDs/paths before allocating a session.
+                theme_arguments(args["theme_id"], args.get("reduced_motion", "auto"))
             w = self._window(args)
+            if name == "tobkiri_cursor" and args.get("action") == "theme":
+                return content(w.set_cursor_theme(args["theme_id"], reduced_motion=args.get("reduced_motion", "auto")))
+            if name == "tobkiri_cursor" and args.get("action") == "state":
+                return content(w.cursor_state())
             if name == "tobkiri_cursor" and args.get("action") == "speed":
                 return content(w.set_cursor_speed(args.get("profile", "fast")))
             if name == "tobkiri_timeline":
@@ -289,7 +302,7 @@ class ToolService:
             if "zoom_id" in args and "point" not in args:
                 raise ComputerError("invalid_target", "zoom_id requires a point in that zoom image.")
             if "label" in args:
-                s = w._observe_current()
+                s = self._snapshot(w, args) if "observation_id" in args else w._observe_current()
                 target = s.find(args["label"], role=args.get("role"))
             elif selectors:
                 s = self._snapshot(w, args)
@@ -302,7 +315,7 @@ class ToolService:
                     target = s.point(*args["point"]) if "point" in args else s.element(args["element_id"])
             else:
                 target = None
-            kwargs = {"expect": args.get("expect")}
+            kwargs = {"expect": args.get("expect"), "readback": args.get("readback", "same")}
             if action == "set_value":
                 if args.get("delivery_mode", "background") != "background":
                     raise ComputerError("invalid_delivery_mode", "set_value is direct semantic replacement; it has no foreground mode.")
@@ -371,13 +384,17 @@ def main():
     parser.add_argument("--socket", help="Explicit host driver socket; otherwise use Tobkiri's saved runtime")
     parser.add_argument("--cursor-coordinates", choices=["screen_points", "window_pixels"],
                         help="Override only after calibrating this driver's overlay contract")
+    parser.add_argument("--cursor-theme", help="Installed theme ID for new helper sessions; omission preserves Cua's native theme")
+    parser.add_argument("--cursor-reduced-motion", choices=["auto", "on", "off"], default="auto",
+                        help="Animation preference when --cursor-theme is set")
     parser.add_argument("--approval", choices=["deny", "terminal", "macos-dialog"], default="deny",
                         help="Trusted host startup setting: per-action human prompt for foreground/desktop input. Default denies; no auto-approve mode.")
     args = parser.parse_args()
     from .runtime import driver_command
     command = driver_command(driver=args.driver, endpoint=args.socket)
     approval = {"deny": None, "terminal": TerminalConsent(), "macos-dialog": MacOSDialogConsent()}[args.approval]
-    with Computer(command=command, cursor_coordinates=args.cursor_coordinates, approval_callback=approval) as computer:
+    with Computer(command=command, cursor_coordinates=args.cursor_coordinates, approval_callback=approval,
+                  cursor_theme=args.cursor_theme, cursor_reduced_motion=args.cursor_reduced_motion) as computer:
         service = ToolService(computer, compact=args.surface == "compact")
         for line in sys.stdin:
             request_id = None

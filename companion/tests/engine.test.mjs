@@ -111,12 +111,15 @@ test("the head remains round at the midpoint of a turn", () => {
   );
   assert.equal(arcs[0][2], defaults.head);
 });
-test("hotspot is exact while character eases; hidden sessions retire", () => {
+test("anchor glides and the input pose starts at the dispatch point", () => {
   const c = new Character(defaults, 10, 20);
-  c.receive({ point: [200, 300], phase: "start", action: "type" });
+  c.receive({ point: [200, 300], phase: "anchor", action: "move" });
   c.update(0.016);
   assert.equal(c.tx, 200);
   assert.ok(c.x < 200);
+  c.receive({ point: [200, 300], phase: "start", action: "type" });
+  assert.equal(c.x, 200);
+  assert.equal(c.y, 300);
   assert.equal(c.action, "type");
   c.receive({
     point: [200, 300],

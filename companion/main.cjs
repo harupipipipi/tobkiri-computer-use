@@ -8,10 +8,11 @@ const {
   Tray,
   nativeImage,
 } = require("electron");
+const os = require("node:os");
 const path = require("node:path");
-const fs = require("node:fs/promises");
 const dgram = require("node:dgram");
 const { parseEvent } = require("./protocol.cjs");
+const { loadStudioPack, publishPack, writePack } = require("./cursor-pack.cjs");
 let studio,
   config,
   validatePack,
@@ -20,19 +21,6 @@ let studio,
   enabled = false,
   quitting = false;
 let tray;
-let sharedPackFile = process.env.TOBKIRI_CURSOR_PACK;
-async function publishPack() {
-  if (!sharedPackFile || !config) return;
-  // Presentation only. Publishing failures never grant permission or send input.
-  try {
-    await fs.mkdir(path.dirname(sharedPackFile), { recursive: true });
-    const temp = sharedPackFile + '.tmp';
-    await fs.writeFile(temp, JSON.stringify(config), { mode: 0o600 });
-    await fs.rename(temp, sharedPackFile);
-  } catch (error) {
-    console.error('Shared cursor pack: ' + error.code);
-  }
-}
 const overlays = new Map(),
   sessions = new Map();
 const arrivals = new Map();
@@ -41,6 +29,38 @@ const port = Number(process.env.TOBKIRI_COMPANION_PORT || 47831);
 const smokeTest = process.argv.includes("--smoke-test");
 const recordTest = process.argv.includes("--record-test");
 let agentMode = process.argv.includes("--agent-mode");
+const packArg = process.argv.indexOf("--cursor-pack");
+const configuredPack =
+  (packArg >= 0 && process.argv[packArg + 1]) || process.env.TOBKIRI_CURSOR_PACK;
+let packOverride = configuredPack ? path.resolve(configuredPack) : null;
+const defaultPackFile =
+  smokeTest || recordTest
+    ? null
+    : path.join(os.homedir(), ".tobkiri-tabs", "cursor-pack.json");
+const sharedPackFile = () => packOverride || defaultPackFile;
+const publishedPacks = new Set();
+let cursorPackError = false;
+let packWrites = Promise.resolve();
+
+function queuePackWrite(write) {
+  const pending = packWrites.then(write);
+  packWrites = pending.catch(() => {});
+  return pending;
+}
+
+async function shareStudioPack() {
+  const file = sharedPackFile();
+  if (!file) return;
+  try {
+    await publishPack(file, config, { preserveExisting: !publishedPacks.has(file) });
+    publishedPacks.add(file);
+    cursorPackError = false;
+  } catch (error) {
+    cursorPackError = true;
+    console.error("Shared cursor pack:", error.code || error.message);
+  }
+}
+
 // Opt-in for the user's live recording. Normally overlays stay out of captures.
 const recordable = process.argv.includes("--recordable");
 if (smokeTest)
@@ -71,7 +91,7 @@ function fanout(channel, event) {
   for (const win of overlays.values()) send(win, channel, event);
 }
 function state() {
-  return { config, enabled, status, port, desktop: true };
+  return { config, enabled, status, port, desktop: true, cursorPackError };
 }
 function overlayWindows() {
   for (const win of overlays.values()) win.close();
@@ -151,37 +171,51 @@ function receive(buffer, remote) {
   sessions.set(key, { seq: event.seq, time: Date.now() });
   fanout("event", event);
 }
-if (!app.requestSingleInstanceLock()) app.quit();
+if (!app.requestSingleInstanceLock({ cursorPackFile: packOverride })) app.quit();
 else {
-  app.on("second-instance", (_event, argv) => {
-    if (argv.includes("--agent-mode")) {
-      agentMode = true;
-      const packIndex = argv.indexOf('--cursor-pack');
-      if (packIndex >= 0 && argv[packIndex + 1]) sharedPackFile = argv[packIndex + 1];
-      if (config) config.mode = "computer";
-      void publishPack();
-      setEnabled(true);
-    } else studio?.show();
+  app.on("second-instance", (_event, argv, _workingDirectory, data) => {
+    const useComputer = argv.includes("--agent-mode");
+    const override =
+      typeof data?.cursorPackFile === "string" && path.isAbsolute(data.cursorPackFile)
+        ? data.cursorPackFile
+        : null;
+    if (!config) {
+      if (override) packOverride = override;
+      if (useComputer) agentMode = true;
+      return;
+    }
+    void queuePackWrite(async () => {
+      if (override) packOverride = override;
+      if (useComputer) {
+        agentMode = true;
+        config = { ...config, mode: "computer" };
+      }
+      if (useComputer || override) await shareStudioPack();
+      if (useComputer) setEnabled(true);
+      else {
+        if (!smokeTest) studio?.show();
+        if (override) fanout("config", state());
+      }
+    });
   });
   app
     .whenReady()
     .then(async () => {
       ({ validatePack } = await import("./src/config.js"));
       const { defaults } = await import("./src/config.js");
-      config = structuredClone(defaults);
       const configFile = path.join(app.getPath("userData"), "character.json");
-      try {
-        config = validatePack(
-          JSON.parse(await fs.readFile(configFile, "utf8")),
-        );
-      } catch (error) {
-        if (error.code === "ENOENT" && sharedPackFile) config.displayMode = "both";
-        if (error.code !== "ENOENT")
-          status =
-            "保存した設定を読み込めませんでした。標準設定で起動しました。";
-      }
-      if (agentMode) config.mode = "computer";
-      await publishPack();
+      await queuePackWrite(async () => {
+        config = structuredClone(defaults);
+        try {
+          config = await loadStudioPack(configFile, sharedPackFile(), defaults, validatePack);
+          if (agentMode) config.mode = "computer";
+          await shareStudioPack();
+        } catch (error) {
+          cursorPackError = Boolean(sharedPackFile());
+          status = "保存した設定を読み込めませんでした。標準設定で起動しました。";
+          console.error("Cursor Studio settings:", error.code || error.message);
+        }
+      });
       Menu.setApplicationMenu(null);
       const area = screen.getPrimaryDisplay().workAreaSize;
       studio = new BrowserWindow({
@@ -238,13 +272,13 @@ else {
       ipcMain.handle("save", async (event, pack) => {
         if (event.sender !== studio?.webContents) throw Error("Studio only");
         const next = validatePack(pack);
-        const temp = configFile + ".tmp";
-        await fs.writeFile(temp, JSON.stringify(next));
-        await fs.rename(temp, configFile);
-        config = next;
-        await publishPack();
-        fanout("config", state());
-        return state();
+        return queuePackWrite(async () => {
+          await writePack(configFile, next);
+          config = next;
+          await shareStudioPack();
+          fanout("config", state());
+          return state();
+        });
       });
       ipcMain.handle("overlay", (event, value) => {
         if (event.sender !== studio?.webContents) throw Error("Studio only");

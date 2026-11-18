@@ -54,6 +54,20 @@ def test_private_text_never_leaves_input_transport(rig, receiver):
     assert sum(name == "type_text" for name, _ in transport.calls) == 1
 
 
+def test_renderer_sync_is_opt_in(receiver, monkeypatch):
+    monkeypatch.delenv("TOBKIRI_COMPANION_SYNC", raising=False)
+    pub = CompanionPublisher(True)
+    try:
+        pub.anchor("one", (12, 23))
+        with pub.action("one", "click", {}):
+            pass
+        assert [e["phase"] for e in drain(receiver)] == ["anchor", "start", "end"]
+        assert pub.status()["sync_enabled"] is False
+        assert pub.status()["sync_elapsed_ms"] == 0
+    finally:
+        pub.close()
+
+
 def test_geometry_translation_hide_and_close(rig, receiver):
     c, t = rig
     enable(c)

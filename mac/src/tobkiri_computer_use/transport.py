@@ -34,6 +34,19 @@ def structured(result: dict) -> dict:
     return {}
 
 
+def session_ended(result, tool):
+    if not isinstance(result, dict) or not result.get("isError"):
+        return False
+    error = structured(result)
+    if error.get("code") == "session_ended":
+        return True
+    # The daemon's MCP proxy wraps an ended-session refusal at the RPC edge.
+    return error.get("code") == "tool_invocation_failed" and any(
+        block.get("type") == "text" and f"has ended; tool call '{tool}' was rejected." in block.get("text", "")
+        for block in result.get("content", [])
+    )
+
+
 class McpTransport:
     def __init__(self, command=None, timeout=180.0):
         self.timeout = timeout
@@ -117,7 +130,13 @@ class McpTransport:
             raise ComputerError("timeout", f"{method} timed out; input outcome is unknown. Observe before retrying.") from exc
 
     def call(self, name, arguments=None):
-        result = self.request("tools/call", {"name": name, "arguments": arguments or {}})
+        args = arguments or {}
+        params = {"name": name, "arguments": args}
+        result = self.request("tools/call", params)
+        if name in ("list_apps", "list_windows") and "session" not in args and session_ended(result, name):
+            started = self.request("tools/call", {"name": "start_session", "arguments": {}})
+            if not started.get("isError"):
+                result = self.request("tools/call", params)
         if result.get("isError"):
             message = "\n".join(b.get("text", "") for b in result.get("content", []) if b.get("type") == "text")
             raise ComputerError("driver_error", f"{name}: {message}", details=result)

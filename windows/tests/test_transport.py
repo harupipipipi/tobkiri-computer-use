@@ -31,6 +31,27 @@ def test_tool_errors_are_raised():
             t.call("test")
 
 
+@pytest.mark.parametrize("name", ["list_windows", "click"])
+def test_ended_implicit_session_only_restarts_discovery(monkeypatch, name):
+    transport = object.__new__(McpTransport)
+    actions = []
+
+    def request(method, params):
+        actions.append(params["name"])
+        if len(actions) == 1:
+            return {"isError": True, "structuredContent": {"code": "session_ended"}}
+        return {"structuredContent": {}}
+
+    monkeypatch.setattr(transport, "request", request)
+    if name == "list_windows":
+        transport.call(name)
+        assert actions == ["list_windows", "start_session", "list_windows"]
+    else:
+        with pytest.raises(ComputerError):
+            transport.call(name)
+        assert actions == ["click"]
+
+
 def test_disconnect_wakes_pending_request():
     with McpTransport(COMMAND) as t, ThreadPoolExecutor() as pool:
         pending=pool.submit(t.request,"hang")

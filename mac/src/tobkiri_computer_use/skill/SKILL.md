@@ -61,6 +61,16 @@ a screenshot frame. AX `frame` values are native screen points, not screenshot
 pixels; do not fabricate screenshot points from them. Image-only controls and
 visual completion checks need an appropriate observation route.
 
+Use `readback="ax"` on `tobkiri_act` or the Python action when AX evidence is
+sufficient. This skips image acquisition and uses the native interactive route
+when advertised. Pass the current `observation_id` with a label to reuse that
+observation. Observe with a screenshot again before the next pixel or zoom action.
+
+When an Open or Save sheet appears in the originating window's AX tree, use
+that window's fresh `AXSheet` descendants for semantic actions. macOS lists
+the panel's compositor surface separately, so its standalone window ID can
+report `ax_unresolved`.
+
 Use `action="set_value", text="..."` for native editable fields. For renderer
 inputs, prefer tab tools when available, or observed native AX/pixel input.
 When using `type_text`, verify actual content.
@@ -266,6 +276,16 @@ targets stop this polling; an ended or revoked session is reported, never revive
 Raw Cua cursors follow exact windows observed on the same connection. Keep the
 same session and explicit target. Legacy Cua `from_zoom` needs recapturing after
 window translation; prefer `tobkiri_zoom` for persistent crop coordinates.
+
+## Cursor themes
+
+Use `window.set_cursor_theme("cua.default")` to select Cua artwork on either OS.
+Installed `tobkiri.arrow`, `tobkiri.stickman` and custom IDs use the same API.
+MCP `tobkiri_cursor(action="theme", theme_id="...")` selects artwork;
+`action="state"` reads the native theme and fallback. Read
+[cursor themes](references/cursor-themes.md) for independent session themes,
+reduced motion and trusted local source/installation. Theme changes send no app
+input, and neither an acknowledgement nor metadata proves painted pixels.
 
 ## Multiple cursors
 

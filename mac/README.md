@@ -1,5 +1,10 @@
 # Tobkiri Computer Use
 
+Mac・Windowsで共通のカーソルテーマを選べます。Cua標準を保ちながら、Windows風の矢印、
+棒人間、独自のアニメーションを追加できます。
+`window.set_cursor_theme("cua.default")`でCuaの見た目に戻せます。
+素材の導入とPython/MCPの使い方は[カーソルテーマ](docs/CURSOR_THEMES.md)を参照してください。
+
 Cua Driverを基盤にした、Python / MCP向けのComputer Use。ウィンドウに結びついた座標、
 要素の検索、ズーム、クリック履歴とプレビュー、複数の仮想カーソルを提供します。
 
@@ -176,6 +181,11 @@ endpointの新規設定でブラウザ設定UIや前面入力が必要な場合�
 重要操作の意味はagent/host側で判断し、Pythonの座標クリックが自動分類するとは保証しません。
 ネイティブ文字欄の全体置換は`window.set_value(field, "...")`、挿入は
 `window.type_text(field, "...")`、キーは`window.press_key("a", target=field)`を使います。
+`readback="ax"` をPythonの操作や `tobkiri_act` に指定すると、操作後はアクセシビリティだけを取得します。
+対応するネイティブビルドでは、観測済みの要素へのクリックと値設定の応答も短くなります。
+次に画像座標を使う場合は、スクリーンショット付きで観測し直してください。
+添付型のファイル選択シートは、開いた元のウィンドウで新しく観測し、`AXSheet` 配下の要素を使います。
+[計測値とネイティブパッチの手順](docs/LATENCY.md#操作後の読み戻し)。
 `observe()`の`input.background_keyboard`で配送経路の状態を確認できます。
 複数窓でキーの配送先を証明できない場合は拒否します。Web入力は対象タブに結びついた
 `browser_type`等を優先し、AX値だけを成功の証拠にしないでください。
@@ -253,6 +263,9 @@ desktopの画面読み取りや、window targetでの仮想カーソル描画に
 [テレポート設定](patches/cua-driver-0.28.2/TELEPORT_README.md)を参照してください。
 0013を含むCua 0.28.2では、既定の`fast`設定がカーソルを瞬間移動させ、
 クリック前の描画到着待ちを省きます。未適用のドライバーでは従来の1ms移動です。
+
+固定画面の連打では、対応するCua 0.28.2ビルドが観測済みの座標変換を再利用します。
+[固定ボタンの連打の実測](docs/LATENCY.md#固定ボタンの連打)を参照してください。
 
 ## 比較と限界
 

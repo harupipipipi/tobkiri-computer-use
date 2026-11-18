@@ -46,6 +46,86 @@ def test_cross_window_points_refused(rig):
     assert not any(n == "click" for n,_ in t.calls)
 
 
+def test_ax_readback_invalidates_pixels_and_preserves_image_defaults(rig):
+    c, transport = rig
+    window = c.window(pid=7, window_id=10)
+    original = window.observe(max_dimension=450)
+    transport.calls.clear()
+    readback = window.click(original.find("Increment"), readback="ax").observation
+    assert readback.frame is None and readback.image is None
+    assert [args["include_screenshot"] for name, args in transport.calls
+            if name == "get_window_state"] == [False]
+    with pytest.raises(ComputerError, match="Observe this exact window again"):
+        window.click(original.point(25, 25))
+    final = window.set_value(readback.find("Name"), "Ada").observation
+    assert final.image is not None and final.frame.pixel_width == 450
+
+
+def test_background_keyboard_preflight_uses_accessibility_only(rig):
+    c, transport = rig
+    window = c.window(pid=7, window_id=10)
+    window.observe()
+    transport.calls.clear()
+    window.press_key("return")
+    assert [args["include_screenshot"] for name, args in transport.calls
+            if name == "get_window_state"] == [False, True]
+
+
+def test_fresh_observation_can_reopen_an_ended_window_session(rig, monkeypatch):
+    c, transport = rig
+    w = window(c)
+    current = w.observe(screenshot=False)
+    w.set_cursor_speed("normal")
+    native = transport._call
+    expired = {"click", "get_window_state"}
+
+    def invoke(name, args):
+        if name in expired:
+            expired.remove(name)
+            raise ComputerError("driver_error", "session expired",
+                                details={"isError": True, "structuredContent": {"code": "session_ended"}})
+        return native(name, args)
+
+    monkeypatch.setattr(transport, "_call", invoke)
+    transport.calls.clear()
+    with pytest.raises(ComputerError, match="session expired"):
+        w.click(current.find("Increment"))
+    assert [name for name, _ in transport.calls] == ["click"]
+
+    renewed = w.observe(screenshot=False)
+    assert renewed.id != current.id
+    assert [name for name, _ in transport.calls[1:]] == [
+        "get_window_state", "start_session", "set_agent_cursor_enabled",
+        "set_agent_cursor_motion", "get_window_state",
+    ]
+    assert transport.calls[-2][1]["dwell_after_click_ms"] == 80
+
+
+def test_ax_readback_uses_advertised_exact_routes_without_replaying_input(rig, monkeypatch):
+    c, transport = rig
+    monkeypatch.setattr(transport, "list_tools", lambda: [
+        {"name": "tobkiri_click_observed", "inputSchema": {"properties": {"element_token": {}}}},
+        {"name": "tobkiri_set_value", "inputSchema": {"properties": {"element_token": {}}}},
+    ])
+    native = transport._call
+
+    def invoke(name, args):
+        return native({"tobkiri_click_observed": "click", "tobkiri_set_value": "set_value"}.get(name, name), args)
+
+    monkeypatch.setattr(transport, "_call", invoke)
+    w = window(c)
+    s = w.observe(screenshot=False)
+    after = w.click(s.find("Increment"), readback="ax").observation
+    r = w.set_value(after.find("Name"), "Ada", readback="ax")
+    assert r.observation.find("Name").value == "Ada"
+    inputs = [(name, args) for name, args in transport.calls if name in {
+        "click", "set_value", "tobkiri_click_observed", "tobkiri_set_value",
+    }]
+    assert [name for name, _ in inputs] == ["tobkiri_click_observed", "tobkiri_set_value"]
+    assert all(args["pid"] == 7 and args["window_id"] == 10 and "element_token" in args
+               and "target" not in args for _, args in inputs)
+
+
 def test_moved_window_keeps_local_point_and_refreshes_native_frame(rig):
     c,t=rig; w=window(c); s=w.observe()
     t.bounds["x"] += 200

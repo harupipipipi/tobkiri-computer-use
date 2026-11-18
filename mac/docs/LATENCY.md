@@ -95,3 +95,64 @@ Cua自身も同一アプリ/PIDの背景操作を直列化するため、物理�
 - [クリックのAX・ピクセル経路](https://github.com/trycua/cua/blob/fc188250b4ca8549b8e61f937fdb1fb560770e86/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs)
 
 調査用チェックアウトは`artifacts/cua-source`に隔離し、配布パッケージには含めない。
+
+## 固定ボタンの連打
+
+2026-11-15に専用のTobkiriFixtureで計測した。スケジューラーへの指定は1ms間隔で、
+`on_late="stretch"`により遅れが出たときは以降の時刻をずらした。A/Bと描画面は、
+アプリ内で受け取ったイベントの時刻から間隔を算出した。
+
+| A/B交互、アプリ受信間隔の中央値 | 間隔 |
+| --- | ---: |
+| Candidate13、通常のカーソルアニメーション | 1,671ms |
+| Candidate13、カーソルの瞬間移動 | 239ms |
+| Candidate14、座標確認からPNG処理を省略 | 167ms |
+| Candidate17、瞬間移動と観測済み座標変換の再利用 | 127ms |
+
+Candidate17のA/B交互では、カーソル移動RPCが中央値1.0ms、座標と兄弟窓の確認が
+0.6ms、ネイティブの対象確認が7.0ms、`AXPress`の応答が102msだった。
+描画面に送った12組のマウスの押下・解放も受領を確認した。押下間隔は中央値1,311msで、
+クリック後のウィンドウ変化確認に1,046ms、マウスイベント送信に126msを要した。
+ここでの`AXPress`と押下の時刻は、楽器の音の立ち上がりを計測したものではない。
+
+高速な座標変換は、そのドライバーが`tobkiri_click_observed`を公開する場合に
+`Window.timeline()`が使う。ネイティブのスナップショットIDから既に検証した画像の幅・高さを
+得て、入力ごとにウィンドウの所有者、表示状態、位置・サイズ、タイトル、兄弟窓との重なりを
+確認する。平行移動では同じウィンドウを撮り直し、ローカルのAXレイアウトが一致すれば
+観測IDと座標を維持する。ウィンドウやスナップショットが変わった場合は停止する。
+通常の座標クリックは従来のCua APIを使う。
+
+Candidate17をビルドするには、[Candidate13のパッチ列](../patches/cua-driver-0.28.2/TELEPORT_README.md)
+に0014、0015、0016、0017を順に追加し、`--app-name CuaDriverCandidate17ClickTiming`を指定する。
+既存のパッチ適用済みソースを使う場合は、`build-report.json`に記録された列を維持して
+残りを追加する。実測は独立したソケット上の同じ署名の候補ドライバーで行った。
+
+## 操作後の読み戻し
+
+専用の AppKit テストウィンドウで、文字欄への値設定を各条件で6回実行した。
+Candidate20の中央値は、操作から結果の読み戻しまで **1,390ms → 326ms**。
+
+| 処理 | 画像付きの従来経路 | `readback="ax"` |
+| --- | ---: | ---: |
+| ネイティブの値設定とウィンドウ変化の確認 | 1,107ms | 217ms |
+| 操作後の観測 | 256ms | 66ms |
+| 操作全体 | 1,390ms | 326ms |
+
+短い経路は観測済みの要素トークンで背景操作し、ウィンドウ変化を最大120ms観測した後、
+同じウィンドウのAXを読み戻す。ファイル選択シートは親ウィンドウへの現在のAX接続を
+確認した上で、シート内の要素を操作できる。クリップボードの待ち時間はネイティブ処理の開始後
+5秒に制限し、処理が残っている間は次の要求を保留せず拒否する。
+
+[Candidate13のパッチ列](../patches/cua-driver-0.28.2/TELEPORT_README.md) に
+0014から0020を順に追加してビルドする。候補を既存の標準モードと同じ設定の別ソケットで
+起動してから、`mac/` で次を実行する。
+
+```sh
+.venv/bin/python scripts/build_fixture.py
+.venv/bin/python scripts/live_acceptance.py --measure-readback \
+  --driver "$candidate_driver" --socket "$candidate_socket" \
+  --output-dir artifacts/interactive-readback
+.venv/bin/python scripts/live_acceptance.py --probe-file-sheet \
+  --driver "$candidate_driver" --socket "$candidate_socket" \
+  --output-dir artifacts/interactive-file-sheet
+```

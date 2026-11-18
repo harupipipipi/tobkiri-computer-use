@@ -6,6 +6,10 @@ UIA / PostMessage 経路では対象を前面化せず、ユーザーのフォ�
 
 検証済み構成は Windows 11、Python 3.13、Cua Driver 0.28.2 です。Python 3.11 以上を要求します。
 
+Mac・Windows共通のテーマAPIを追加しました。`window.set_cursor_theme("cua.default")`で
+Cua本来の見た目を選べます。Windows風の矢印・棒人間・独自素材の導入は
+[カーソルテーマ](docs/CURSOR_THEMES.md)を参照してください。新テーマのWindows実機表示は未確認です。
+
 ## セットアップ
 
 PowerShell で `windows/` に移動して実行します。
@@ -61,6 +65,7 @@ with Computer(approval_callback=WindowsDialogConsent()) as computer:
 ## Windows の配送方針
 
 - UIA の `invoke` / `set_value` / `scroll` と Cua のウィンドウ宛て合成イベントを最優先します。
+- UIAで結果を確認できる操作に `readback="ax"` を指定すると、操作後の画像取得を省略できます。
 - バックグラウンドで配送できない場合は、構造化エラーを返し、自動で前面入力へ昇格しません。
 - Cua Driver 0.28.2 がバックグラウンド drag を `global_input` として扱う問題は、送信前に拒否します。
 - 明示的な `delivery_mode="foreground"` と一操作承認がある場合だけ、Windows 0.28.2 の

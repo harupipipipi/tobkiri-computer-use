@@ -55,6 +55,7 @@ def physical_point(point, window_id):
 class CompanionPublisher:
     def __init__(self, enabled=None):
         self.enabled = os.environ.get("TOBKIRI_COMPANION") == "1" if enabled is None else bool(enabled)
+        self.sync_enabled = self.enabled and os.environ.get("TOBKIRI_COMPANION_SYNC") == "1"
         self.source = uuid.uuid4().hex
         self._socket = None
         self._seq = 0
@@ -83,7 +84,7 @@ class CompanionPublisher:
     def status(self):
         return {"enabled": self.enabled, "transport": "loopback_udp", "error": self.error,
                 "port": self._address[1] if self._address else None,
-                "renderer_ready": self.last_ready, "sync_error": self.sync_error,
+                "sync_enabled": self.sync_enabled, "renderer_ready": self.last_ready, "sync_error": self.sync_error,
                 "sync_elapsed_ms": self.sync_elapsed_ms, "delivery_verified": False}
 
     def _send(self, session, action, phase, point, outcome="unknown"):
@@ -111,7 +112,7 @@ class CompanionPublisher:
         """
         self.last_ready = False
         self.sync_error = None
-        if not self._socket or os.environ.get("TOBKIRI_COMPANION_SYNC") == "0":
+        if not self._socket or not self.sync_enabled:
             return
         with self._guard:
             seq = self._send(session, action, "prepare", point)

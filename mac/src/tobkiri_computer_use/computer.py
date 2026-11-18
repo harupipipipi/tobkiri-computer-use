@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
+from functools import cached_property
 import base64
 import difflib
 import hashlib
@@ -17,9 +18,10 @@ from PIL import Image
 from .consent import ConsentRequest, InputCoordinator, require_consent, requires_consent
 from .cursor import CursorFollower, RawCursorOwner, MOTION_PROFILES
 from .companion import CompanionPublisher
+from .cursor_themes import REDUCED_MOTION, theme_arguments
 from .geometry import Frame, segment_intersects_rect
 from .models import Element, Observation, Point
-from .transport import ComputerError, McpTransport, structured
+from .transport import ComputerError, McpTransport, session_ended, structured
 
 
 class Computer:
@@ -28,10 +30,17 @@ class Computer:
     The complete upstream tool surface remains available through tool().
     window() and mouse() add bounded observations and safe coordinate handling.
     """
-    def __init__(self, *, command=None, transport=None, cursor_coordinates=None, approval_callback=None, cursor_follow_interval=0.1, cursor_profile="fast", companion=None):
+    def __init__(self, *, command=None, transport=None, cursor_coordinates=None, approval_callback=None,
+                 cursor_follow_interval=0.1, cursor_profile="fast", companion=None,
+                 cursor_theme=None, cursor_reduced_motion="auto"):
         if cursor_profile not in (None, *MOTION_PROFILES):
             raise ValueError("cursor_profile must be fast, normal, or None (native settings)")
         self.cursor_profile = cursor_profile
+        if cursor_reduced_motion not in REDUCED_MOTION:
+            raise ValueError("cursor_reduced_motion must be auto, on, or off")
+        if cursor_theme is not None:
+            theme_arguments(cursor_theme, cursor_reduced_motion)
+        self.cursor_theme, self.cursor_reduced_motion = cursor_theme, cursor_reduced_motion
         if cursor_coordinates not in (None, "screen_points", "window_pixels"):
             raise ValueError("cursor_coordinates must be screen_points or window_pixels")
         if cursor_follow_interval is not None and not .02 <= cursor_follow_interval <= 5:
@@ -256,6 +265,11 @@ class Computer:
     def list_tools(self):
         return self.transport.list_tools()
 
+    @cached_property
+    def _interactive_tools(self):
+        return {tool["name"]: tool["inputSchema"].get("properties", {})
+                for tool in self.list_tools() if tool["name"] in ("tobkiri_click_observed", "tobkiri_set_value")}
+
     def windows(self, *, app=None, title=None, pid=None):
         args = {"pid": pid} if pid is not None else {}
         rows = structured(self.transport.call("list_windows", args)).get("windows", [])
@@ -283,8 +297,19 @@ class Computer:
             self._sessions.add(session)
             self.transport.call("set_agent_cursor_enabled", {"session": session, "enabled": False})
         window = Window(self, key, session, lock)
-        if self.cursor_profile:
-            window.set_cursor_speed(self.cursor_profile)
+        try:
+            if self.cursor_profile:
+                window.set_cursor_speed(self.cursor_profile)
+            if self.cursor_theme is not None:
+                window.set_cursor_theme(self.cursor_theme, reduced_motion=self.cursor_reduced_motion)
+        except BaseException:
+            # Refused/missing themes never fall back to another appearance.
+            # Release the newly started session while preserving the first error.
+            try:
+                window.close()
+            except Exception:
+                pass
+            raise
         return window
 
     def mouse(self, name, *, pid, window_id):
@@ -334,6 +359,7 @@ class Window:
         self._last = None
         self._closed = False
         self._sequence = 0
+        self._cursor_settings = {}
 
     @property
     def target(self):
@@ -342,8 +368,21 @@ class Window:
     def _call(self, name, **args):
         if self._closed or self.computer._closed:
             raise ComputerError("closed", "This window session is closed.")
+        arguments = {"session": self.session, **args}
+        transport = self.computer.transport
         with self.computer._companion.action(self.session, name, args) as receipt:
-            result = self.computer.transport.call(name, {"session": self.session, **args})
+            try:
+                result = transport.call(name, arguments)
+            except ComputerError as error:
+                if name != "get_window_state" or not session_ended(error.details, name):
+                    raise
+                self.computer._latest.pop(self.surface, None)
+                self.computer._cursors.forget(self.session)
+                transport.call("start_session", {"session": self.session})
+                transport.call("set_agent_cursor_enabled", {"session": self.session, "enabled": False})
+                for tool, settings in self._cursor_settings.items():
+                    transport.call(tool, {"session": self.session, **settings})
+                result = transport.call(name, arguments)
             receipt["result"] = result
             return result
 
@@ -356,7 +395,28 @@ class Window:
         if profile not in MOTION_PROFILES:
             raise ValueError("profile must be fast or normal")
         with self._lock:
-            return structured(self._call("set_agent_cursor_motion", **MOTION_PROFILES[profile]))
+            settings = MOTION_PROFILES[profile]
+            result = structured(self._call("set_agent_cursor_motion", **settings))
+            self._cursor_settings["set_agent_cursor_motion"] = settings
+            return result
+
+    def set_cursor_theme(self, theme_id="cua.default", *, reduced_motion="auto"):
+        """Select an installed theme for this session without moving input.
+
+        Cua queues the change to its renderer. cursor_state() reports native
+        theme metadata and fallback; acknowledgement alone is not pixel proof.
+        Source paths and inline artwork belong to the trusted host CLI.
+        """
+        arguments = theme_arguments(theme_id, reduced_motion)
+        with self._lock:
+            result = structured(self._call("set_agent_cursor_theme", **arguments))
+            self._cursor_settings["set_agent_cursor_theme"] = arguments
+            return result
+
+    def cursor_state(self):
+        """Read native theme, animation and visibility without moving input."""
+        with self._lock:
+            return structured(self._call("get_agent_cursor_state"))
 
     def timeline(self, steps, *, start_at=None, max_lateness=.25, on_late="stop", stop_event=None):
         """Run a bounded, pre-observed sequence of background clicks on a static UI.
@@ -385,9 +445,16 @@ class Window:
         return self._observe(screenshot=screenshot, max_dimension=max_dimension,
                              max_elements=max_elements, full_tree=full_tree)
 
-    def _observe_current(self):
-        """Automatic readback keeps the caller's image scale and AX walk budget."""
-        return self.observe(**getattr(self, "_last_options", {}))
+    def _observe_current(self, *, screenshot=None):
+        """Override capture for one observation while retaining the caller's defaults."""
+        with self._lock:
+            options = getattr(self, "_last_options", {})
+            if screenshot is None:
+                return self.observe(**options)
+            try:
+                return self.observe(**{**options, "screenshot": screenshot})
+            finally:
+                self._last_options = options
 
     def _observe(self, *, screenshot=True, max_dimension=1400, max_elements=2000, full_tree=False, translation_from=None):
         with self._lock:
@@ -595,7 +662,14 @@ class Window:
         snapshot.frame.check_pixel(target.x, target.y)
         return {"target": self.target, "x": target.x, "y": target.y}, target, snapshot
 
-    def _perform(self, action, target=None, *, expect=None, fallback_reason=None, **arguments):
+    @staticmethod
+    def _readback_capture(readback):
+        if readback not in ("same", "ax"):
+            raise ValueError('readback must be "same" or "ax"')
+        return False if readback == "ax" else None
+
+    def _perform(self, action, target=None, *, expect=None, fallback_reason=None, readback="same", **arguments):
+        capture = self._readback_capture(readback)
         arguments = json.loads(json.dumps(arguments, allow_nan=False))
         delivery = arguments.get("delivery_mode", "background")
         if delivery not in ("background", "foreground"):
@@ -607,7 +681,8 @@ class Window:
             if target is not None:
                 address, point, before = self._address(target)
             else:
-                before = self._observe_current()
+                keyboard_only = action in ("type_text", "press_key") and delivery == "background"
+                before = self._observe_current(screenshot=False if keyboard_only else None)
                 address, point = {"pid": self.surface[0], "window_id": self.surface[1]}, None
             if action in ("double_click", "right_click") and "target" in address:
                 address = {k: v for k, v in address.items() if k != "target"}
@@ -638,8 +713,20 @@ class Window:
                 self._bind_cursor(before, point, drive="x" in address or action not in ("click", "double_click", "right_click"))
                 if self.computer._latest.get(self.surface) != before.id:
                     raise ComputerError("stale_geometry", "The window resized or disappeared immediately before input; observe again.")
+            native_action, native_args = action, {**address, **arguments}
+            if readback == "ax" and delivery == "background" and action in ("click", "set_value"):
+                tools = self.computer._interactive_tools
+                if action == "set_value" and "element_token" in address and "tobkiri_set_value" in tools:
+                    native_action = "tobkiri_set_value"
+                elif action == "click" and "tobkiri_click_observed" in tools:
+                    if semantic_press and "element_token" in tools["tobkiri_click_observed"]:
+                        native_action, native_args = "tobkiri_click_observed", address
+                    elif "x" in address and before.driver_snapshot_id:
+                        native_action = "tobkiri_click_observed"
+                        native_args = {"pid": self.surface[0], "window_id": self.surface[1],
+                                       "snapshot_id": before.driver_snapshot_id, "x": address["x"], "y": address["y"]}
             self.computer._latest.pop(self.surface, None)
-            raw_result = self._call(action, **address, **arguments)
+            raw_result = self._call(native_action, **native_args)
             delivery_result = structured(raw_result)
             if action in ("click", "double_click", "right_click") and point and before.frame and delivery_result.get("effect") != "refused":
                 self._sequence += 1
@@ -656,34 +743,43 @@ class Window:
             # Even a refused or unverifiable delivery returns current evidence.
             # Never replay input on a timeout or an unchanged tree.
             try:
-                after = self._observe_current()
+                after = self._observe_current(screenshot=capture)
             except Exception as exc:
                 raise ComputerError("post_observation_failed", "Action was attempted but its post-observation failed; do not retry blindly.",
                                     details={"delivery": delivery_result, "error": str(exc)}) from exc
             return ActionResult(action, delivery_result, after, verification, approval)
 
-    def click(self, target, *, button="left", double=False, expect=None, delivery_mode="background", fallback_reason=None):
+    def click(self, target, *, button="left", double=False, expect=None, delivery_mode="background",
+              fallback_reason=None, readback="same"):
         if button not in ("left", "right") or (double and button != "left"):
             raise ComputerError("unsupported_click", "Use raw Cua tools for this click variant.")
         name = "double_click" if double else "right_click" if button == "right" else "click"
-        return self._perform(name, target, expect=expect, delivery_mode=delivery_mode, fallback_reason=fallback_reason)
+        return self._perform(name, target, expect=expect, delivery_mode=delivery_mode,
+                             fallback_reason=fallback_reason, readback=readback)
 
-    def set_value(self, target, value, *, expect=None):
+    def set_value(self, target, value, *, expect=None, readback="same"):
         if isinstance(target, Point):
             raise ComputerError("invalid_target", "set_value requires a semantic element; use type_text for pixels.")
-        return self._perform("set_value", target, value=str(value), expect=expect)
+        return self._perform("set_value", target, value=str(value), expect=expect, readback=readback)
 
-    def type_text(self, target, text, *, expect=None, delivery_mode="background", fallback_reason=None):
-        return self._perform("type_text", target, text=text, expect=expect, delivery_mode=delivery_mode, fallback_reason=fallback_reason)
+    def type_text(self, target, text, *, expect=None, delivery_mode="background",
+                  fallback_reason=None, readback="same"):
+        return self._perform("type_text", target, text=text, expect=expect, delivery_mode=delivery_mode,
+                             fallback_reason=fallback_reason, readback=readback)
 
-    def press_key(self, key, *, target=None, modifiers=None, expect=None, delivery_mode="background", fallback_reason=None):
-        return self._perform("press_key", target, key=key, modifiers=modifiers or [], expect=expect, delivery_mode=delivery_mode, fallback_reason=fallback_reason)
+    def press_key(self, key, *, target=None, modifiers=None, expect=None, delivery_mode="background",
+                  fallback_reason=None, readback="same"):
+        return self._perform("press_key", target, key=key, modifiers=modifiers or [], expect=expect,
+                             delivery_mode=delivery_mode, fallback_reason=fallback_reason, readback=readback)
 
-    def scroll(self, target, direction, *, amount=3, by="line", expect=None, delivery_mode="background", fallback_reason=None):
+    def scroll(self, target, direction, *, amount=3, by="line", expect=None, delivery_mode="background",
+               fallback_reason=None, readback="same"):
         return self._perform("scroll", target, direction=direction, amount=amount, by=by, expect=expect,
-                             delivery_mode=delivery_mode, fallback_reason=fallback_reason)
+                             delivery_mode=delivery_mode, fallback_reason=fallback_reason, readback=readback)
 
-    def drag(self, start: Point, end: Point, *, duration_ms=500, expect=None, delivery_mode="background", fallback_reason=None):
+    def drag(self, start: Point, end: Point, *, duration_ms=500, expect=None, delivery_mode="background",
+             fallback_reason=None, readback="same"):
+        capture = self._readback_capture(readback)
         if delivery_mode not in ("background", "foreground"):
             raise ComputerError("invalid_delivery_mode", "Use background or explicitly approved foreground input.")
         with self.computer._inputs.hold(exclusive=delivery_mode == "foreground"), self._lock:
@@ -711,7 +807,7 @@ class Window:
             result = structured(self._call("drag", **address, **arguments))
             self._bind_cursor(snapshot, end)
             verification = self.verify(expect) if expect else None
-            return ActionResult("drag", result, self._observe_current(), verification, approval)
+            return ActionResult("drag", result, self._observe_current(screenshot=capture), verification, approval)
 
     def verify(self, expect, *, timeout_ms=5000):
         with self._lock:

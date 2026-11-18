@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tobkiri-computer-use"
-version = "0.1.14"
+version = "0.1.15"
 description = "Python and MCP computer use with snapshot-bound targets and multiple agent cursors"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,7 @@ test = ["pytest>=8"]
 tobkiri-computer-use = "tobkiri_computer_use.reloadable:main"
 tobkiri-computer-use-reload = "tobkiri_computer_use.reloadable:reload_main"
 tobkiri-computer-use-setup = "tobkiri_computer_use.runtime:main"
+tobkiri-cursor-theme = "tobkiri_computer_use.cursor_themes:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
