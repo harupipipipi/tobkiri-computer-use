@@ -1,6 +1,6 @@
 """Opt-in acceptance on dedicated TobkiriFixture windows only."""
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from io import BytesIO
 from pathlib import Path
 import argparse
@@ -274,52 +274,97 @@ def measure_readback(command):
     print(json.dumps(report), flush=True)
 
 
-def check_multiwindow(command, *, electron=False):
+def canvas_point(state):
+    with Image.open(BytesIO(state.image)).convert("RGB") as image:
+        # The fixture's canvas is the only saturated pink region.
+        pixels = getattr(image, "get_flattened_data", image.getdata)()
+        indices = [i for i, (r, g, b) in enumerate(pixels)
+                   if r > g + 85 and b > g + 35]
+        assert indices, "Could not find the rendered canvas in the observed window"
+        x = [index % image.width for index in indices]
+        y = [index // image.width for index in indices]
+        return state.point((min(x) + max(x)) / 2, (min(y) + max(y)) / 2)
+
+
+def measure_covered_click(target, sibling, locate, read_count):
+    sibling_before = read_count(sibling.observe(screenshot=False))
+    state = target.observe()
+    before = read_count(state)
+    result = target.click(locate(state), readback="ax")
+    after = read_count(result.observation)
+    deadline = time.monotonic() + 1.2
+    while after == before and time.monotonic() < deadline:
+        time.sleep(.1)
+        after = read_count(target.observe(screenshot=False))
+    return {
+        "target": after - before, "sibling": read_count(sibling.observe(screenshot=False)) - sibling_before,
+        "route": result.delivery.get("route"), "effect": result.delivery.get("effect"),
+    }
+
+
+@contextmanager
+def overlapped_pair(computer, *, electron=False, profile="profile"):
     executable = None
     arguments = ("--overlapping-pair",)
     if electron:
         executable = ROOT.parent / "companion/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron"
-        arguments = (str(ROOT / "tests/fixtures/ElectronComputerFixture.cjs"), str(OUT / "profile"))
+        arguments = (str(ROOT / "tests/fixtures/ElectronComputerFixture.cjs"), str(OUT / profile))
+    with launched_fixture(computer, "Tobkiri Overlap B", *arguments, executable=executable) as second:
+        pid = second.surface[0]
+        with closing(second), closing(computer.window(pid=pid, title="Tobkiri Overlap A")) as first:
+            ids = [second.surface[1], first.surface[1]]
+
+            def positions():
+                return [(row["window_id"], row["bounds"]) for row in computer.windows(pid=pid)
+                        if row["window_id"] in ids and row.get("is_on_screen")]
+            before = positions()
+            assert [window_id for window_id, _ in before] == ids
+            assert before[0][1] == before[1][1]
+            if electron:
+                for window in (first, second):
+                    window.observe(screenshot=False)
+                    window.wait_for(lambda view: bool(view.find_all("Increment", role="AXButton")), timeout=4)
+            yield first, second
+            assert positions() == before
+
+
+def check_multiwindow(command, *, electron=False):
+    def button_point(state):
+        button = state.find("Increment", role="AXButton")
+        return state.point(button.point.x + 4, button.point.y + 2)
+
+    def canvas_hits(state):
+        return int(re.search(r"Canvas hits: (\d+)", state.tree).group(1))
+
     with Computer(command=command, companion=False) as computer:
-        with launched_fixture(computer, "Tobkiri Overlap A", *arguments, executable=executable) as first:
-            pid = first.surface[0]
-            second = computer.window(pid=pid, title="Tobkiri Overlap B")
-            rows = {row["window_id"]: row for row in computer.windows(pid=pid)}
-            assert rows[first.surface[1]]["bounds"] == rows[second.surface[1]]["bounds"]
-            report = {"driver": computer.transport.server_info["version"], "toolkit": "Electron" if electron else "AppKit",
-                      "overlapping": True}
-            try:
+        report = {"driver": computer.transport.server_info["version"], "toolkit": "Electron" if electron else "AppKit",
+                  "overlapping": True}
+        try:
+            with overlapped_pair(computer, electron=electron) as (first, second):
+                primary = measure_covered_click(first, second, button_point, count)
+                report["covered_button"] = primary
+                assert (primary["target"], primary["sibling"]) == (1, 0)
+                if electron:
+                    assert primary["route"] == "accessibility"
+                    report["covered_canvas"] = measure_covered_click(first, second, canvas_point, canvas_hits)
+
+            # A fresh pair isolates the keyboard path from the pointer probes.
+            with overlapped_pair(computer, electron=electron, profile="keyboard-profile") as (first, second):
                 for window, key in ((first, "x"), (second, "y")):
                     state = window.observe(screenshot=False)
-                    if electron and not state.find_all("Name", role="AXTextField"):
-                        state = window.wait_for(lambda view: view.find_all("Name", role="AXTextField"), timeout=4)
                     result = window.press_key(key, target=state.find("Name", role="AXTextField"), readback="ax")
                     assert result.observation.find("Name", role="AXTextField").value == key
                 assert first.observe(screenshot=False).find("Name", role="AXTextField").value == "x"
                 report["separate_key_delivery"] = True
-                second_count = count(second.observe(screenshot=False))
-                state = first.observe()
-                button = state.find("Increment", role="AXButton")
-                clicked = first.click(state.point(button.point.x, button.point.y), readback="ax")
-                first_after = count(clicked.observation)
-                if first_after == count(state):
-                    first_after = count(first.observe(screenshot=False))
-                report["pixel_counts"] = {"target": first_after - count(state),
-                                          "sibling": count(second.observe(screenshot=False)) - second_count}
-                assert report["pixel_counts"]["sibling"] == 0
-                report["exact_pixel_delivery"] = first_after == count(state) + 1
-                if electron and not report["exact_pixel_delivery"]:
-                    state = first.observe(screenshot=False)
-                    clicked = first.click(state.find("Increment", role="AXButton"), readback="ax")
-                    assert count(clicked.observation) == first_after + 1
-                    assert count(second.observe(screenshot=False)) == second_count
-                    report["exact_semantic_delivery"] = True
-                else:
-                    assert report["exact_pixel_delivery"]
-            finally:
-                (OUT / "multiwindow.json").write_text(json.dumps(report, indent=2) + "\n")
-                print(json.dumps(report), flush=True)
-                second.close()
+                if electron:
+                    report["button_after_typing"] = measure_covered_click(first, second, button_point, count)
+                    for key in ("button_after_typing", "covered_canvas"):
+                        assert report[key]["target"] in (0, 1)
+                        assert report[key]["sibling"] == 0
+            report["window_order_preserved"] = True
+        finally:
+            (OUT / "multiwindow.json").write_text(json.dumps(report, indent=2) + "\n")
+            print(json.dumps(report), flush=True)
 
 
 if args.probe_file_sheet:

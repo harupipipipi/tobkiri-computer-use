@@ -563,34 +563,41 @@ class Window:
             self._observe(**self._last_options, translation_from=observation)
         return windows
 
-    def _check_pointer_target(self, observation, points, *, delivery_mode="background", observed_click=False):
+    def _exact_background_route(self, observation, route):
+        proof = observation.raw.get("background_input", {})
+        window = proof.get("exact_window", {})
+        return ((window.get("pid"), window.get("window_id"), window.get("status")) == (*self.surface, "matched")
+                and any(row.get("route") == route and row.get("status") == "available"
+                        for row in proof.get("routes", [])))
+
+    def _check_pointer_target(self, observation, points, *, delivery_mode="background", pixel_click=None):
         windows = self._check_geometry(observation)
         observation = self._last if self._last and self._last.id == observation.id else observation
         if delivery_mode != "background":
-            return
-        if observed_click and self.computer._native_overlapping_clicks:
-            proof = observation.raw.get("background_input", {})
-            window = proof.get("exact_window", {})
-            if ((window.get("pid"), window.get("window_id"), window.get("status")) == (*self.surface, "matched")
-                    and any(row.get("route") == "window_pointer" and row.get("status") == "available"
-                            for row in proof.get("routes", []))):
-                # This driver derives the fresh pixel target in the addressed
-                # window and stamps that native window on background clicks.
-                return
+            return None
         # macOS PID-routed pixel input can be hit-tested against another window
         # of the SAME process. An exact capture id alone does not prove input
         # isolation. Refuse overlapping siblings; a semantic element is safer.
         positions = [observation.frame.to_screen(p.x, p.y) for p in points]
+        segments = list(zip(positions, positions[1:])) or [(positions[0], positions[0])]
         for row in windows:
             if row.get("window_id") == self.surface[1] or row.get("is_on_screen") is False or row.get("on_current_space") is False:
                 continue
             rect = row.get("bounds", {})
             if not all(k in rect for k in ("x", "y", "width", "height")) or rect["width"] <= 0 or rect["height"] <= 0:
                 continue
-            segments = list(zip(positions, positions[1:])) or [(positions[0], positions[0])]
             if any(segment_intersects_rect(start, end, rect) for start, end in segments):
+                if pixel_click == "click" and self._exact_background_route(observation, "accessibility"):
+                    control = observation._pressable_at(points[0])
+                    if control is not None:
+                        return control
+                if (pixel_click and self.computer._native_overlapping_clicks
+                        and self._exact_background_route(observation, "window_pointer")):
+                    # The driver can stamp this exact window on the native event.
+                    return None
                 raise ComputerError("overlapping_window", "Another window of this app covers the input point/path. Use a fresh semantic element instead of pixel input.",
                                     details={"target_window_id": self.surface[1], "overlapping_window_id": row["window_id"]})
+        return None
 
     def _check_keyboard_target(self, observation, delivery_mode):
         if delivery_mode != "background":
@@ -707,15 +714,22 @@ class Window:
             semantic_press = action == "click" and any(
                 e.token == address.get("element_token") and "AXPress" in e.raw.get("actions", [])
                 for e in before.elements if e.token)
+            pixel_target = "x" in address and "y" in address
             pointer_action = action in ("click", "double_click", "right_click", "scroll") and not semantic_press
-            if pointer_action or ("x" in address and "y" in address):
+            if pointer_action or pixel_target:
                 if point is None or before.frame is None:
                     raise ComputerError("no_pixel_frame", "This input may use pointer events; a visible, measured target is required.")
-                self._check_pointer_target(before, [point], delivery_mode=delivery,
-                                           observed_click=action in ("click", "double_click") and "x" in address)
+                control = self._check_pointer_target(before, [point], delivery_mode=delivery,
+                                                     pixel_click=action if pixel_target and action in ("click", "double_click") else None)
                 # A second live bounds read may have refreshed native tokens.
                 if target is not None and self._last is not before:
-                    address, point, before = self._address(target)
+                    if pixel_target:
+                        before = self._last
+                    else:
+                        address, point, before = self._address(target)
+                if control is not None:
+                    address = {"pid": self.surface[0], "window_id": self.surface[1], "element_token": control.token}
+                    semantic_press = True
             approval = None
             if delivery == "foreground":
                 address, before, approval = self._approve_foreground(action, address, before, arguments, fallback_reason)
@@ -726,7 +740,7 @@ class Window:
                 # Explicit AX clicks animate inside Cua. Pixel clicks can take
                 # Cua's early AX hit-test return, which skips its cursor update;
                 # retain one fast pre-move for those so visuals stay synchronized.
-                self._bind_cursor(before, point, drive="x" in address or action not in ("click", "double_click", "right_click"))
+                self._bind_cursor(before, point, drive=pixel_target or action not in ("click", "double_click", "right_click"))
                 if self.computer._latest.get(self.surface) != before.id:
                     raise ComputerError("stale_geometry", "The window resized or disappeared immediately before input; observe again.")
             native_action, native_args = action, {**address, **arguments}

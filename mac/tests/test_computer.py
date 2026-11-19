@@ -309,6 +309,39 @@ def test_overlap_click_requires_a_native_exact_window_report(rig, reported_windo
         assert not any(name == "click" for name, _ in transport.calls)
 
 
+@pytest.mark.parametrize("case", ["unique", "competing_frame", "truncated", "foreign_proof", "disabled"])
+def test_covered_point_uses_only_an_unambiguous_window_local_press(rig, case):
+    c, transport = rig
+    transport.sibling_offset = 0
+    w = window(c)
+    state = w.observe()
+    control = state.find("Increment")
+    control.raw["parent_index"] = 0
+    state.raw["background_input"] = {
+        "exact_window": {"pid": 7, "window_id": 11 if case == "foreign_proof" else 10, "status": "matched"},
+        "routes": [{"route": "accessibility", "status": "available"}],
+    }
+    if case == "competing_frame":
+        state.find("Name").raw.update(frame=control.raw["frame"], parent_index=0)
+    if case == "truncated":
+        state.raw["truncated"] = True
+    if case == "disabled":
+        control.raw["enabled"] = False
+    point = state.point(control.point.x + 6, control.point.y + 2)
+    if case == "unique":
+        result = w.click(point, readback="ax")
+        assert result.delivery["effect"] == "unverifiable"
+        calls = [args for name, args in transport.calls if name == "click"]
+        assert calls == [{"session": w.session, "pid": 7, "window_id": 10,
+                          "element_token": control.token, "delivery_mode": "background"}]
+        assert transport.counts == {10: 1, 11: 0}
+    else:
+        with pytest.raises(ComputerError) as exc:
+            w.click(point)
+        assert exc.value.code == "overlapping_window"
+        assert not any(name == "click" for name, _ in transport.calls)
+
+
 @pytest.mark.parametrize("status", ["refused","unknown","unavailable"])
 def test_unproven_keyboard_delivery_never_reaches_another_window(rig,status):
     c,t=rig; t.keyboard_status=status; w=window(c)

@@ -84,9 +84,12 @@ No helper automatically retries input or switches to foreground mode.
 With the tested macOS Cua Driver 0.54.0 runtime, keep the other windows open
 and address the requested window by PID and window ID. Use the fresh native
 `pid_keyboard` route reported by that window. Cua confirms the intended
-in-app key window before dispatch. If a covered Electron surface produces
-no change after a pixel click, inspect the current state and use an observed
-AX action when the control exposes one.
+in-app key window before dispatch. A background left click at a screenshot
+point in an overlapping window can use the exact window's `AXPress` control
+when the reported accessibility route and element bounds identify it
+unambiguously. A canvas or a double click still requires the native pointer
+route. Inspect the result before acting again, particularly on Electron
+surfaces with no visible response to a background click.
 
 `overlapping_window` means another window of the same app intersects a pointer
 location or drag path. Use a fresh element exposing `AXPress` where appropriate;

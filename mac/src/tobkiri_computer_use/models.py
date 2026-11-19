@@ -15,6 +15,11 @@ from .transport import ComputerError
 from .version import VERSION
 
 
+_PRESS_CONTROL_ROLES = frozenset({
+    "AXButton", "AXCheckBox", "AXDisclosureTriangle", "AXLink", "AXRadioButton", "AXSwitch", "AXTab",
+})
+
+
 @dataclass(frozen=True)
 class Point:
     x: float
@@ -142,6 +147,41 @@ class Observation:
             raise ComputerError("no_pixel_frame", "Observe with screenshot=True before pixel actions.")
         self.frame.check_pixel(x, y)
         return Point(x, y, self.id, self.surface)
+
+    def _pressable_at(self, point):
+        """Resolve a control in this window's AX tree without a screen hit-test."""
+        if self.raw.get("truncated"):
+            return None
+        x, y = self.frame.to_screen(point.x, point.y)
+        elements = {e.id: e for e in self.elements}
+        hits = []
+        for element in elements.values():
+            if element.point is None:
+                continue
+            rect = element.raw["frame"]
+            if rect["x"] <= x < rect["x"] + rect["w"] and rect["y"] <= y < rect["y"] + rect["h"]:
+                hits.append(element)
+        presses = [e for e in hits if "AXPress" in e.raw.get("actions", [])]
+        if len(presses) != 1:
+            return None
+        control = presses[0]
+        if not control.token or control.raw.get("enabled") is False or control.role not in _PRESS_CONTROL_ROLES:
+            return None
+
+        def ancestry(element):
+            lineage = set()
+            while element is not None and element.id not in lineage:
+                lineage.add(element.id)
+                element = elements.get(element.raw.get("parent_index"))
+            return lineage
+
+        branch = ancestry(control)
+        if not any(elements[index].role == "AXWindow" for index in branch):
+            return None
+        # AX rectangles do not describe stacking between independent branches.
+        if any(e.id not in branch and control.id not in ancestry(e) for e in hits):
+            return None
+        return control
 
     def grid(self, region, *, rows, columns):
         """Return rows of snapshot-bound points at evenly spaced cell centers.
