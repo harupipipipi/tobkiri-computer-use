@@ -92,9 +92,9 @@ class CursorFollower:
 
     def _hide(self, a, phase):
         self.computer._companion.hide(a.owner.session)
-        if not a.hidden:
+        if not a.hidden and not self.computer._companion.enabled:
             a.owner._call("set_agent_cursor_enabled", enabled=False)
-            a.hidden = True
+        a.hidden = True
         a.phase = phase
 
     def _update(self, a, rows, *, force=False, drive=True):
@@ -134,6 +134,12 @@ class CursorFollower:
                 if not force and a.origin == origin and not a.hidden:
                     self.computer._companion.anchor(owner.session, current.to_screen(a.x, a.y))
                     return
+                if self.computer._companion.enabled:
+                    # The companion uses window geometry directly. Its screen
+                    # point is independent of the driver's native cursor units.
+                    a.origin, a.hidden, a.phase, a.error = origin, False, "following", None
+                    self.computer._companion.anchor(owner.session, current.to_screen(a.x, a.y))
+                    return
                 mode = self.computer.cursor_coordinates
                 if mode is None:
                     self._hide(a, "unsupported_driver")
@@ -141,7 +147,7 @@ class CursorFollower:
                 x, y = current.to_screen(a.x, a.y) if mode == "screen_points" else (a.x, a.y)
                 # Exact window target never moves the real OS pointer. Modern
                 # target and legacy scope/pid/window_id are mutually exclusive.
-                if a.hidden and not self.computer._companion.enabled:
+                if a.hidden:
                     owner._call("set_agent_cursor_enabled", enabled=True)
                     # Cua's enable command is queued to the render thread. Its
                     # move path skips drawing entirely while disabled. Allow one

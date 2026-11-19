@@ -64,6 +64,10 @@ class Computer:
         # pixel transform and consumes global screen points. Do NOT generalize
         # this workaround to unknown driver builds.
         version = self.transport.server_info.get("version", "")
+        # Cua 0.54 defaults to a compact response. Exact-window helpers still
+        # need its structured elements, snapshot tokens and input route report.
+        self._window_state_options = {"full_output": True} if version == "0.54.0" else {}
+        self._native_overlapping_clicks = version == "0.54.0"
         self.cursor_coordinates = cursor_coordinates or (
             "screen_points" if sys.platform == "darwin" and version == "0.28.2" else None)
 
@@ -171,7 +175,7 @@ class Computer:
                             or (e.get("element_index") == args.get("element_index") and old.get("snapshot_id") == args.get("snapshot_id"))), None)
             if element is None:
                 raise ComputerError("stale_observation", "The supplied element was not in this window's recorded snapshot.")
-        raw = structured(self.transport.call("get_window_state", options))
+        raw = structured(self.transport.call("get_window_state", {**self._window_state_options, **options}))
         b = raw.get("window_bounds", {})
         fresh = Frame(*(b[k] for k in ("x", "y", "width", "height")), raw.get("screenshot_width", 0), raw.get("screenshot_height", 0))
         if (raw.get("pid"), raw.get("window_id")) != surface or not raw.get("screenshot_frame_valid", True) or not frame.same_size(fresh) or Window._layout_raw(old) != Window._layout_raw(raw):
@@ -459,7 +463,8 @@ class Window:
     def _observe(self, *, screenshot=True, max_dimension=1400, max_elements=2000, full_tree=False, translation_from=None):
         with self._lock:
             result = self._call("get_window_state", pid=self.surface[0], window_id=self.surface[1],
-                                include_screenshot=screenshot, max_dimension=max_dimension, max_elements=max_elements)
+                                include_screenshot=screenshot, max_dimension=max_dimension, max_elements=max_elements,
+                                **self.computer._window_state_options)
             raw = structured(result)
             if (raw.get("pid"), raw.get("window_id")) != self.surface:
                 raise ComputerError("target_mismatch", "Driver returned a different window; input was not sent.")
@@ -508,7 +513,8 @@ class Window:
             self._last_options = {"screenshot": screenshot, "max_dimension": max_dimension,
                                   "max_elements": max_elements, "full_tree": full_tree}
             self.computer._latest[self.surface] = snapshot.id
-            if frame and not self.computer._cursors.has(self) and self.computer.cursor_coordinates is not None:
+            if (frame and not self.computer._cursors.has(self)
+                    and (self.computer._companion.enabled or self.computer.cursor_coordinates is not None)):
                 self._bind_cursor(snapshot, snapshot.point(frame.pixel_width/2, frame.pixel_height/2))
             snapshot.cursor = self.computer._cursors.status(self)
             return snapshot
@@ -557,11 +563,20 @@ class Window:
             self._observe(**self._last_options, translation_from=observation)
         return windows
 
-    def _check_pointer_target(self, observation, points, *, delivery_mode="background"):
+    def _check_pointer_target(self, observation, points, *, delivery_mode="background", observed_click=False):
         windows = self._check_geometry(observation)
         observation = self._last if self._last and self._last.id == observation.id else observation
         if delivery_mode != "background":
             return
+        if observed_click and self.computer._native_overlapping_clicks:
+            proof = observation.raw.get("background_input", {})
+            window = proof.get("exact_window", {})
+            if ((window.get("pid"), window.get("window_id"), window.get("status")) == (*self.surface, "matched")
+                    and any(row.get("route") == "window_pointer" and row.get("status") == "available"
+                            for row in proof.get("routes", []))):
+                # This driver derives the fresh pixel target in the addressed
+                # window and stamps that native window on background clicks.
+                return
         # macOS PID-routed pixel input can be hit-tested against another window
         # of the SAME process. An exact capture id alone does not prove input
         # isolation. Refuse overlapping siblings; a semantic element is safer.
@@ -696,7 +711,8 @@ class Window:
             if pointer_action or ("x" in address and "y" in address):
                 if point is None or before.frame is None:
                     raise ComputerError("no_pixel_frame", "This input may use pointer events; a visible, measured target is required.")
-                self._check_pointer_target(before, [point], delivery_mode=delivery)
+                self._check_pointer_target(before, [point], delivery_mode=delivery,
+                                           observed_click=action in ("click", "double_click") and "x" in address)
                 # A second live bounds read may have refreshed native tokens.
                 if target is not None and self._last is not before:
                     address, point, before = self._address(target)
@@ -822,7 +838,7 @@ class Window:
                 raise ComputerError("no_pixel_frame", "Cursor movement needs a visible, measured element center.")
             screen_x, screen_y = snapshot.frame.to_screen(point.x, point.y)
             mode = self.computer.cursor_coordinates
-            if mode is None:
+            if mode is None and not self.computer._companion.enabled:
                 raise ComputerError("cursor_contract_unknown", "Driver cursor coordinates are unverified for this build. Set cursor_coordinates only after calibration.")
             follow = self.computer._cursors.bind(self, snapshot.frame, point.x, point.y)
             if follow["phase"] != "following":

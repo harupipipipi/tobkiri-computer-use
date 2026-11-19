@@ -81,6 +81,13 @@ workaround. Read `observation.input.background_keyboard` before choosing keys.
 `press_key` uses a single key plus `modifiers`, e.g. `key="a", modifiers=["cmd"]`.
 No helper automatically retries input or switches to foreground mode.
 
+With the tested macOS Cua Driver 0.54.0 runtime, keep the other windows open
+and address the requested window by PID and window ID. Use the fresh native
+`pid_keyboard` route reported by that window. Cua confirms the intended
+in-app key window before dispatch. If a covered Electron surface produces
+no change after a pixel click, inspect the current state and use an observed
+AX action when the control exposes one.
+
 `overlapping_window` means another window of the same app intersects a pointer
 location or drag path. Use a fresh element exposing `AXPress` where appropriate;
 do not repeat the rejected pixel action through a raw tool. On

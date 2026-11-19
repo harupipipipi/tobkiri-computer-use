@@ -308,6 +308,7 @@ var windows: [NSWindow] = []
 let single = CommandLine.arguments.contains("--single") || Bundle.main.object(forInfoDictionaryKey: "TobkiriSingleWindow") as? Bool == true
 let drawing = CommandLine.arguments.contains("--drawing") || Bundle.main.object(forInfoDictionaryKey: "TobkiriDrawingMode") as? Bool == true
 let timelineProfile = CommandLine.arguments.contains("--profile-timeline")
+let overlappingPair = CommandLine.arguments.contains("--overlapping-pair")
 var timelineControls: TimelineControls?
 var fileSheetControls: FileSheetControls?
 let fileDirectory: URL? = {
@@ -320,10 +321,14 @@ let fileDirectory: URL? = {
 let labels = drawing ? [] : (single ? ["A"] : ["A", "B"])
 for (i, label) in labels.enumerated() {
     let c = Controls()
-    let w = NSWindow(contentRect: NSRect(x: 80 + i * 510, y: 210, width: 480, height: 340),
+    let w = NSWindow(contentRect: NSRect(x: overlappingPair ? 80 : 80 + i * 510,
+                                         y: 210, width: 480, height: 340),
                      styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-    w.title = "Tobkiri Fixture \(label)"
+    w.title = overlappingPair ? "Tobkiri Overlap \(label)" : "Tobkiri Fixture \(label)"
     w.isReleasedWhenClosed = false
+    if overlappingPair {
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    }
     if let directory = fileDirectory {
         w.title = "Tobkiri File Fixture"
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]

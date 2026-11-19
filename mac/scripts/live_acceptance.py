@@ -32,6 +32,10 @@ mode.add_argument("--probe-file-sheet", action="store_true",
                   help="Inspect a native Open sheet owned by a disposable TobkiriFixture")
 mode.add_argument("--measure-readback", action="store_true",
                   help="Measure semantic edits with image or AX-only readback in a disposable fixture")
+mode.add_argument("--check-multiwindow", action="store_true",
+                  help="Check exact routing between two overlapping disposable TobkiriFixture windows")
+mode.add_argument("--check-electron-multiwindow", action="store_true",
+                  help="Run the same exact-window check on a disposable Electron pair")
 parser.add_argument("--wait-demo-start", action="store_true",
                     help="Pause the fast demo after saving initial observations; Enter starts it")
 args = parser.parse_args()
@@ -51,8 +55,8 @@ def count(state):
 
 
 @contextmanager
-def launched_fixture(computer, title, *arguments):
-    binary = ROOT / "artifacts/TobkiriFixture.app/Contents/MacOS/TobkiriFixture"
+def launched_fixture(computer, title, *arguments, executable=None):
+    binary = executable or ROOT / "artifacts/TobkiriFixture.app/Contents/MacOS/TobkiriFixture"
     with subprocess.Popen([str(binary), *arguments], stdout=subprocess.DEVNULL) as fixture:
         try:
             deadline = time.monotonic() + 8
@@ -270,11 +274,62 @@ def measure_readback(command):
     print(json.dumps(report), flush=True)
 
 
+def check_multiwindow(command, *, electron=False):
+    executable = None
+    arguments = ("--overlapping-pair",)
+    if electron:
+        executable = ROOT.parent / "companion/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron"
+        arguments = (str(ROOT / "tests/fixtures/ElectronComputerFixture.cjs"), str(OUT / "profile"))
+    with Computer(command=command, companion=False) as computer:
+        with launched_fixture(computer, "Tobkiri Overlap A", *arguments, executable=executable) as first:
+            pid = first.surface[0]
+            second = computer.window(pid=pid, title="Tobkiri Overlap B")
+            rows = {row["window_id"]: row for row in computer.windows(pid=pid)}
+            assert rows[first.surface[1]]["bounds"] == rows[second.surface[1]]["bounds"]
+            report = {"driver": computer.transport.server_info["version"], "toolkit": "Electron" if electron else "AppKit",
+                      "overlapping": True}
+            try:
+                for window, key in ((first, "x"), (second, "y")):
+                    state = window.observe(screenshot=False)
+                    if electron and not state.find_all("Name", role="AXTextField"):
+                        state = window.wait_for(lambda view: view.find_all("Name", role="AXTextField"), timeout=4)
+                    result = window.press_key(key, target=state.find("Name", role="AXTextField"), readback="ax")
+                    assert result.observation.find("Name", role="AXTextField").value == key
+                assert first.observe(screenshot=False).find("Name", role="AXTextField").value == "x"
+                report["separate_key_delivery"] = True
+                second_count = count(second.observe(screenshot=False))
+                state = first.observe()
+                button = state.find("Increment", role="AXButton")
+                clicked = first.click(state.point(button.point.x, button.point.y), readback="ax")
+                first_after = count(clicked.observation)
+                if first_after == count(state):
+                    first_after = count(first.observe(screenshot=False))
+                report["pixel_counts"] = {"target": first_after - count(state),
+                                          "sibling": count(second.observe(screenshot=False)) - second_count}
+                assert report["pixel_counts"]["sibling"] == 0
+                report["exact_pixel_delivery"] = first_after == count(state) + 1
+                if electron and not report["exact_pixel_delivery"]:
+                    state = first.observe(screenshot=False)
+                    clicked = first.click(state.find("Increment", role="AXButton"), readback="ax")
+                    assert count(clicked.observation) == first_after + 1
+                    assert count(second.observe(screenshot=False)) == second_count
+                    report["exact_semantic_delivery"] = True
+                else:
+                    assert report["exact_pixel_delivery"]
+            finally:
+                (OUT / "multiwindow.json").write_text(json.dumps(report, indent=2) + "\n")
+                print(json.dumps(report), flush=True)
+                second.close()
+
+
 if args.probe_file_sheet:
     probe_file_sheet(command)
     raise SystemExit(0)
 if args.measure_readback:
     measure_readback(command)
+    raise SystemExit(0)
+if args.check_multiwindow or args.check_electron_multiwindow:
+    check_multiwindow(command, electron=args.check_electron_multiwindow)
     raise SystemExit(0)
 if args.profile_timeline:
     profile_timeline(command)

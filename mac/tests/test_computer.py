@@ -287,6 +287,28 @@ def test_overlapping_sibling_pixel_input_refused_semantic_still_targets_exact_wi
     assert next(a for n,a in t.calls if n=="click")["window_id"]==10
 
 
+@pytest.mark.parametrize("reported_window_id", [10, 11])
+def test_overlap_click_requires_a_native_exact_window_report(rig, reported_window_id):
+    c, transport = rig
+    c._native_overlapping_clicks = True
+    transport.sibling_offset = 0
+    w = window(c)
+    state = w.observe()
+    state.raw["background_input"] = {
+        "exact_window": {"pid": 7, "window_id": reported_window_id, "status": "matched"},
+        "routes": [{"route": "window_pointer", "status": "available"}],
+    }
+    point = state.find("Increment").point
+    if reported_window_id == 10:
+        w.click(point)
+        assert transport.counts == {10: 1, 11: 0}
+    else:
+        with pytest.raises(ComputerError) as exc:
+            w.click(point)
+        assert exc.value.code == "overlapping_window"
+        assert not any(name == "click" for name, _ in transport.calls)
+
+
 @pytest.mark.parametrize("status", ["refused","unknown","unavailable"])
 def test_unproven_keyboard_delivery_never_reaches_another_window(rig,status):
     c,t=rig; t.keyboard_status=status; w=window(c)

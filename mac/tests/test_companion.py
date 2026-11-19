@@ -140,10 +140,11 @@ def test_port_error_is_visual_only(monkeypatch):
 def test_character_move_does_not_query_disabled_native_marker(rig, receiver):
     c, transport = rig
     enable(c)
+    c.cursor_coordinates = None
     transport.error = "get_agent_cursor_state"
     w = c.window(pid=7, window_id=10)
     moved = w.move(w.observe().point(200, 160))
     assert moved["reported_position"] is None
     assert moved["position_matches"] is None
     assert moved["follow"]["phase"] == "following"
-    assert not any(name == "get_agent_cursor_state" for name, _ in transport.calls)
+    assert not any(name in ("get_agent_cursor_state", "move_cursor") for name, _ in transport.calls)
