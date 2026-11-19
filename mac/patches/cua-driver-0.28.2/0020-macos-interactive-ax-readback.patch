@@ -1,0 +1,317 @@
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs
+@@ -283,6 +283,7 @@
+     "press_key",
+     "hotkey",
+     "set_value",
++    "tobkiri_set_value",
+     "bring_to_front",
+     "set_window_frame",
+ ];
+@@ -891,6 +892,7 @@
+         | "press_key"
+         | "hotkey"
+         | "set_value"
++        | "tobkiri_set_value"
+         | "invoke_menu"
+         | "launch_app"
+         | "bring_to_front"
+@@ -1133,7 +1135,11 @@
+     }
+     // The observed-screenshot route is a restricted window click. Honor
+     // every policy and manifest rule for click, including an explicit deny.
+-    let policy_tool = if tool == "tobkiri_click_observed" { "click" } else { tool };
++    let policy_tool = match tool {
++        "tobkiri_click_observed" => "click",
++        "tobkiri_set_value" => "set_value",
++        _ => tool,
++    };
+     crate::policy::authorize_tool_call(policy_tool, args)?;
+     let risk = classify_tool_call(tool, args);
+     if risk.class == RiskClass::Unclassified {
+@@ -1193,6 +1199,7 @@
+             | "press_key"
+             | "hotkey"
+             | "set_value"
++            | "tobkiri_set_value"
+             | "kill_app"
+             | "bring_to_front"
+             | "get_accessibility_tree"
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/capture_scope.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/capture_scope.rs
+@@ -176,6 +176,7 @@
+             | "press_key"
+             | "hotkey"
+             | "set_value"
++            | "tobkiri_set_value"
+     )
+ }
+ 
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/tool.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/tool.rs
+@@ -314,7 +314,7 @@
+         // contract is intentionally narrower than `type_text`'s. It
+         // still accepts `element_token`, hence the tokens claim.
+         "type_text_chars" => &["input.keyboard.type", "accessibility.element_tokens"],
+-        "set_value" => &[
++        "set_value" | "tobkiri_set_value" => &[
+             // Bulk-set an editable field's value — semantically a
+             // typing surface, even though the implementation skips
+             // per-key events.
+@@ -1537,10 +1537,11 @@
+         // pid may now start even while result projection and evidence capture
+         // finish for the completed call.
+         drop(_text_input_admission);
++        let result_contract = if resolved_name == "tobkiri_set_value" { "set_value" } else { resolved_name };
+         if result.action_record.is_none() {
+             if let Some(structured) = result.structured_content.as_ref() {
+                 result.action_record = crate::action_record::ActionExecutionRecord::from_legacy(
+-                    resolved_name,
++                    result_contract,
+                     &public_args,
+                     structured,
+                 );
+@@ -1549,7 +1550,7 @@
+                 // them through an empty payload so internal accounting exists
+                 // before the public contract cutover.
+                 result.action_record = crate::action_record::ActionExecutionRecord::from_legacy(
+-                    resolved_name,
++                    result_contract,
+                     &public_args,
+                     &Value::Null,
+                 );
+@@ -1590,7 +1591,7 @@
+                 None
+             }
+         });
+-        if result.is_error != Some(true) && crate::action_record::is_action_tool(resolved_name) {
++        if result.is_error != Some(true) && crate::action_record::is_action_tool(result_contract) {
+             if let Err(error) = publish_action_result(&mut result) {
+                 result = ToolResult::error(format!(
+                     "internal action outcome mismatch for {resolved_name}: {error}; the tool may have executed. Verify state before retrying."
+@@ -1606,7 +1607,7 @@
+         if result.is_error != Some(true) {
+             if let Some(structured) = result.structured_content.clone() {
+                 if let Err(error) =
+-                    cua_driver_contract::validate_success_output(resolved_name, structured)
++                    cua_driver_contract::validate_success_output(result_contract, structured)
+                 {
+                     result = ToolResult::error(format!(
+                         "internal typed output mismatch for {resolved_name}: {error}; the tool may have executed. Verify state before retrying."
+@@ -2568,6 +2569,7 @@
+             | "press_key"
+             | "hotkey"
+             | "set_value"
++            | "tobkiri_set_value"
+             | "bring_to_front"
+             | "set_window_frame"
+     )
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
+@@ -218,13 +218,12 @@
+     }
+ 
+     async fn invoke(&self, args: Value) -> ToolResult {
+-        self.invoke_click(args, None).await
++        self.invoke_click(args, None, false).await
+     }
+ }
+ 
+-/// Static-window replay entry point. Accepts only a current, exact native
+-/// screenshot snapshot and background left-clicks. The ordinary click tool
+-/// keeps its independently captured pixel-frame validation.
++/// Background left-click on verified screenshot pixels or AXPress on a
++/// recent element token. Both stay scoped to the observed exact window.
+ pub struct ObservedClickTool(pub ClickTool);
+ 
+ #[async_trait]
+@@ -233,15 +232,22 @@
+         static OBSERVED: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+         OBSERVED.get_or_init(|| ToolDef {
+             name: "tobkiri_click_observed".into(),
+-            description: "Background left click on pixels of the latest verified exact-window screenshot. For static layouts; observe again after window changes.".into(),
++            description: "Background left click on a verified exact-window screenshot or AXPress on its current element token. Observe again after window changes.".into(),
+             input_schema: serde_json::json!({
+                 "type": "object", "additionalProperties": false,
+-                "required": ["pid", "window_id", "snapshot_id", "x", "y"],
++                "required": ["pid", "window_id"],
++                "oneOf": [
++                    {"required": ["snapshot_id", "x", "y"], "not": {"required": ["element_token"]}},
++                    {"required": ["element_token"], "not": {"anyOf": [
++                        {"required": ["snapshot_id"]}, {"required": ["x"]}, {"required": ["y"]}
++                    ]}}
++                ],
+                 "properties": {
+                     "session": {"type": "string"},
+                     "pid": {"type": "integer", "minimum": 1, "maximum": i32::MAX},
+                     "window_id": {"type": "integer", "minimum": 1, "maximum": u32::MAX},
+                     "snapshot_id": {"type": "string"},
++                    "element_token": cua_driver_core::tool_schema::element_token_schema(),
+                     "x": {"type": "number", "minimum": 0},
+                     "y": {"type": "number", "minimum": 0}
+                 }
+@@ -254,32 +260,41 @@
+         let snapshot_id = args["snapshot_id"].as_str().and_then(cua_driver_core::element_token::parse_snapshot_handle);
+         let pid = args["pid"].as_i64().and_then(|pid| i32::try_from(pid).ok()).filter(|pid| *pid > 0);
+         let wid = args["window_id"].as_u64().and_then(|wid| u32::try_from(wid).ok()).filter(|wid| *wid > 0);
+-        let (Some(pid), Some(wid), Some(snapshot_id), Some(x), Some(y)) =
+-            (pid, wid, snapshot_id, args["x"].as_f64(), args["y"].as_f64())
+-        else {
+-            return ToolResult::error("An exact window, screenshot snapshot_id and pixel x/y are required.");
++        let (Some(pid), Some(wid)) = (pid, wid) else {
++            return ToolResult::error("An exact window pid and window_id are required.");
+         };
+         if !args["scope"].is_null() || !args["delivery_mode"].is_null()
+             || !args["target"].is_null()
+         {
+             return ToolResult::error("Observed clicks accept only the pid/window_id background route.");
+         }
++        let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
++        if let Some(token) = args["element_token"].as_str().filter(|token| !token.is_empty()) {
++            if !args["snapshot_id"].is_null() || !args["x"].is_null() || !args["y"].is_null() {
++                return ToolResult::error("Use a single element token or screenshot pixels.");
++            }
++            return self.0.invoke_click(serde_json::json!({
++                "pid": pid, "window_id": wid, "element_token": token, "session": cursor_key,
++            }), None, true).await;
++        }
++        let (Some(snapshot_id), Some(x), Some(y)) = (snapshot_id, args["x"].as_f64(), args["y"].as_f64()) else {
++            return ToolResult::error("A screenshot snapshot_id and pixel x/y or an element token are required.");
++        };
+         let Some(frame) = self.0.state.element_cache.snapshot_metadata(
+             pid, u64::from(wid), snapshot_id, |payload| payload.pixel_frame.clone(),
+         ) else {
+             return ToolResult::error("The screenshot snapshot expired or has no verified pixel frame.")
+                 .with_structured(serde_json::json!({"code": "stale_observation", "effect": "refused"}));
+         };
+-        let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
+         self.0.invoke_click(serde_json::json!({
+             "pid": pid, "window_id": wid, "x": x, "y": y, "session": cursor_key,
+-        }), Some(frame)).await
++        }), Some(frame), false).await
+     }
+ }
+ 
+ impl ClickTool {
+     async fn invoke_click(
+-        &self, args: Value, observed: Option<super::px_frame::ObservedPixelFrame>,
++        &self, args: Value, observed: Option<super::px_frame::ObservedPixelFrame>, interactive_element: bool,
+     ) -> ToolResult {
+         use cua_driver_core::tool_args::ArgsExt;
+ 
+@@ -647,7 +662,7 @@
+             // verified coordinate frame only for those collection-like
+             // elements so perform_ax_click can cross that one failed semantic
+             // rung internally and confirm the result by AX read-back.
+-            let selection_candidate = if effective_action == "press" {
++            let selection_candidate = if effective_action == "press" && !interactive_element {
+                 let selection_guard = element_guard.clone();
+                 tokio::task::spawn_blocking(move || {
+                     crate::input::ax_actions::nearest_container_selection_state(
+@@ -785,7 +800,11 @@
+             .await;
+ 
+             // Drop the wildcard lease + detect window/foreground side-effects.
+-            let changes = super::finish_window_observation(snapshot, &args).await;
++            let changes = if interactive_element {
++                super::finish_interactive_observation(snapshot).await
++            } else {
++                super::finish_window_observation(snapshot, &args).await
++            };
+ 
+             match result {
+                 Ok(Ok((
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
+@@ -387,6 +387,19 @@
+     } else {
+         snapshot.detect_async().await
+     }
++}
++
++/// Tobkiri's exact-element helpers read the target again immediately. Keep
++/// focus suppression and a short window-change poll through that transition.
++pub(crate) async fn finish_interactive_observation(
++    snapshot: crate::window_change_detector::Snapshot,
++) -> crate::window_change_detector::Changes {
++    use std::time::Duration;
++    tokio::task::spawn_blocking(move || {
++        snapshot.detect_with(Duration::from_millis(120), Duration::from_millis(30))
++    })
++    .await
++    .unwrap_or_else(|_| crate::window_change_detector::Changes::no_change())
+ }
+ 
+ #[cfg(test)]
+@@ -1040,6 +1053,9 @@
+         set_value::SetValueTool::new(state.clone()),
+         &pid_window_candidates,
+     ));
++    registry.register(Box::new(set_value::InteractiveSetValueTool(
++        set_value::SetValueTool::new(state.clone()),
++    )));
+     registry.register(pid_window_guarded(
+         scroll::ScrollTool::new(state.clone()),
+         &pid_window_candidates,
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/set_value.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/set_value.rs
+@@ -94,6 +94,46 @@
+     }
+ 
+     async fn invoke(&self, args: Value) -> ToolResult {
++        self.invoke_value(args, false).await
++    }
++}
++
++pub struct InteractiveSetValueTool(pub SetValueTool);
++
++#[async_trait]
++impl Tool for InteractiveSetValueTool {
++    fn def(&self) -> &ToolDef {
++        static INTERACTIVE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
++        INTERACTIVE_DEF.get_or_init(|| {
++            let mut definition = def().clone();
++            definition.name = "tobkiri_set_value".into();
++            definition.description = "Set a snapshot-bound element value for immediate exact-window readback.".into();
++            definition.input_schema["required"] =
++                serde_json::json!(["pid", "window_id", "element_token", "value"]);
++            definition.input_schema["properties"].as_object_mut().unwrap().remove("element_index");
++            definition.input_schema["properties"].as_object_mut().unwrap().remove("snapshot_id");
++            definition
++        })
++    }
++
++    async fn invoke(&self, args: Value) -> ToolResult {
++        if !args["pid"].as_i64().is_some_and(|pid| pid > 0)
++            || !args["window_id"].as_u64().is_some_and(|id| id > 0)
++            || !args["element_token"].as_str().is_some_and(|token| !token.is_empty())
++            || !args["target"].is_null() || !args["scope"].is_null()
++        {
++            return ToolResult::error("Set value requires an exact window and a current element token.");
++        }
++        self.0.invoke_value(serde_json::json!({
++            "pid": args["pid"], "window_id": args["window_id"],
++            "element_token": args["element_token"], "value": args["value"],
++            "session": super::cursor_tools::resolve_cursor_key(&args),
++        }), true).await
++    }
++}
++
++impl SetValueTool {
++    async fn invoke_value(&self, args: Value, interactive_readback: bool) -> ToolResult {
+         use cua_driver_core::tool_args::ArgsExt;
+         let pid = match args.require_i32("pid") {
+             Ok(v) => v,
+@@ -217,7 +257,11 @@
+         )
+         .await;
+ 
+-        let changes = snapshot.detect_async().await;
++        let changes = if interactive_readback {
++            super::finish_interactive_observation(snapshot).await
++        } else {
++            snapshot.detect_async().await
++        };
+ 
+         match result {
+             Ok(Ok(mut outcome)) => {

@@ -82,6 +82,9 @@ def run_timeline(window, steps, *, start_at=None, max_lateness=.25, on_late="sto
             last_time = step.at
         frame, rows = _live_frame(window, snapshot)
         origin = (snapshot.frame.x, snapshot.frame.y)
+        use_observed_frame = bool(snapshot.driver_snapshot_id) and any(
+            tool["name"] == "tobkiri_click_observed" for tool in window.computer.list_tools()
+        )
         # Start after validation by default. Supplying a shared future start_at
         # allows independent windows to use the same Python clock.
         epoch = time.monotonic() if start_at is None else start_at
@@ -94,7 +97,17 @@ def run_timeline(window, steps, *, start_at=None, max_lateness=.25, on_late="sto
                     status = "cancelled"
                     break
                 frame, rows = _live_frame(window, snapshot)
-                if (frame.x, frame.y) != origin:
+                translated = (frame.x, frame.y) != origin
+                if translated and use_observed_frame:
+                    # The faster driver binds the frame to the native snapshot.
+                    # Keep the logical ID only when the local AX layout agrees.
+                    snapshot = window._observe(**window._last_options, translation_from=snapshot)
+                    window.computer._latest.pop(window.surface, None)
+                    if ((snapshot.frame.x, snapshot.frame.y) != (frame.x, frame.y)
+                            or not snapshot.driver_snapshot_id):
+                        raise ComputerError("stale_geometry", "Window moved during capture; remaining input was stopped")
+                    origin = (frame.x, frame.y)
+                elif translated:
                     # Refresh Cua's screenshot transform after translation, but
                     # do not walk the AX tree at every beat. Local pixels stay put.
                     raw = structured(window._call("get_window_state", pid=window.surface[0], window_id=window.surface[1],
@@ -138,8 +151,14 @@ def run_timeline(window, steps, *, start_at=None, max_lateness=.25, on_late="sto
                           "point": [step.point.x, step.point.y]}
                 records.append(record)
                 try:
-                    result = structured(cursor._call("click", target=window.target, x=step.point.x, y=step.point.y,
-                                                     delivery_mode="background"))
+                    point = {"x": step.point.x, "y": step.point.y}
+                    if use_observed_frame:
+                        result = structured(cursor._call("tobkiri_click_observed", **point,
+                                                         pid=window.surface[0], window_id=window.surface[1],
+                                                         snapshot_id=snapshot.driver_snapshot_id))
+                    else:
+                        result = structured(cursor._call("click", target=window.target, **point,
+                                                         delivery_mode="background"))
                 except ComputerError as exc:
                     record["error"] = exc.as_dict()
                     record["outcome"] = "unknown; input may have landed"

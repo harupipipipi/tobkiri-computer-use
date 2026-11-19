@@ -54,6 +54,20 @@ def test_private_text_never_leaves_input_transport(rig, receiver):
     assert sum(name == "type_text" for name, _ in transport.calls) == 1
 
 
+def test_renderer_sync_is_opt_in(receiver, monkeypatch):
+    monkeypatch.delenv("TOBKIRI_COMPANION_SYNC", raising=False)
+    pub = CompanionPublisher(True)
+    try:
+        pub.anchor("one", (12, 23))
+        with pub.action("one", "click", {}):
+            pass
+        assert [e["phase"] for e in drain(receiver)] == ["anchor", "start", "end"]
+        assert pub.status()["sync_enabled"] is False
+        assert pub.status()["sync_elapsed_ms"] == 0
+    finally:
+        pub.close()
+
+
 def test_geometry_translation_hide_and_close(rig, receiver):
     c, t = rig
     enable(c)
@@ -126,10 +140,11 @@ def test_port_error_is_visual_only(monkeypatch):
 def test_character_move_does_not_query_disabled_native_marker(rig, receiver):
     c, transport = rig
     enable(c)
+    c.cursor_coordinates = None
     transport.error = "get_agent_cursor_state"
     w = c.window(pid=7, window_id=10)
     moved = w.move(w.observe().point(200, 160))
     assert moved["reported_position"] is None
     assert moved["position_matches"] is None
     assert moved["follow"]["phase"] == "following"
-    assert not any(name == "get_agent_cursor_state" for name, _ in transport.calls)
+    assert not any(name in ("get_agent_cursor_state", "move_cursor") for name, _ in transport.calls)

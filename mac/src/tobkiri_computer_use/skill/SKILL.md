@@ -61,6 +61,16 @@ a screenshot frame. AX `frame` values are native screen points, not screenshot
 pixels; do not fabricate screenshot points from them. Image-only controls and
 visual completion checks need an appropriate observation route.
 
+Use `readback="ax"` on `tobkiri_act` or the Python action when AX evidence is
+sufficient. This skips image acquisition and uses the native interactive route
+when advertised. Pass the current `observation_id` with a label to reuse that
+observation. Observe with a screenshot again before the next pixel or zoom action.
+
+When an Open or Save sheet appears in the originating window's AX tree, use
+that window's fresh `AXSheet` descendants for semantic actions. macOS lists
+the panel's compositor surface separately, so its standalone window ID can
+report `ax_unresolved`.
+
 Use `action="set_value", text="..."` for native editable fields. For renderer
 inputs, prefer tab tools when available, or observed native AX/pixel input.
 When using `type_text`, verify actual content.
@@ -70,6 +80,16 @@ the caret or require releasing the user's focus. `type_text` inserts text;
 workaround. Read `observation.input.background_keyboard` before choosing keys.
 `press_key` uses a single key plus `modifiers`, e.g. `key="a", modifiers=["cmd"]`.
 No helper automatically retries input or switches to foreground mode.
+
+With the tested macOS Cua Driver 0.54.0 runtime, keep the other windows open
+and address the requested window by PID and window ID. Use the fresh native
+`pid_keyboard` route reported by that window. Cua confirms the intended
+in-app key window before dispatch. A background left click at a screenshot
+point in an overlapping window can use the exact window's `AXPress` control
+when the reported accessibility route and element bounds identify it
+unambiguously. A canvas or a double click still requires the native pointer
+route. Inspect the result before acting again, particularly on Electron
+surfaces with no visible response to a background click.
 
 `overlapping_window` means another window of the same app intersects a pointer
 location or drag path. Use a fresh element exposing `AXPress` where appropriate;
@@ -266,6 +286,16 @@ targets stop this polling; an ended or revoked session is reported, never revive
 Raw Cua cursors follow exact windows observed on the same connection. Keep the
 same session and explicit target. Legacy Cua `from_zoom` needs recapturing after
 window translation; prefer `tobkiri_zoom` for persistent crop coordinates.
+
+## Cursor themes
+
+Use `window.set_cursor_theme("cua.default")` to select Cua artwork on either OS.
+Installed `tobkiri.arrow`, `tobkiri.stickman` and custom IDs use the same API.
+MCP `tobkiri_cursor(action="theme", theme_id="...")` selects artwork;
+`action="state"` reads the native theme and fallback. Read
+[cursor themes](references/cursor-themes.md) for independent session themes,
+reduced motion and trusted local source/installation. Theme changes send no app
+input, and neither an acknowledgement nor metadata proves painted pixels.
 
 ## Multiple cursors
 

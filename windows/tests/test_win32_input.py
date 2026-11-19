@@ -1,5 +1,7 @@
 from tobkiri_computer_use import ConsentDecision
 from tobkiri_computer_use import win32_input
+import tobkiri_computer_use.computer as computer_module
+from types import SimpleNamespace
 
 
 def allow(request):
@@ -11,6 +13,7 @@ def test_window_pixel_mapping_uses_actual_hwnd_rectangle():
 
 
 def test_windows_0282_foreground_scroll_uses_consent_gated_win32_fallback(rig, monkeypatch):
+    monkeypatch.setattr(computer_module, "sys", SimpleNamespace(platform="win32"))
     computer, transport = rig
     transport.server_info = {"name": "cua-driver", "version": "0.28.2"}
     computer._approval_callback = allow
@@ -33,6 +36,7 @@ def test_windows_0282_foreground_scroll_uses_consent_gated_win32_fallback(rig, m
 
 
 def test_windows_0282_foreground_drag_uses_consent_gated_win32_fallback(rig, monkeypatch):
+    monkeypatch.setattr(computer_module, "sys", SimpleNamespace(platform="win32"))
     computer, transport = rig
     transport.server_info = {"name": "cua-driver", "version": "0.28.2"}
     computer._approval_callback = allow

@@ -1,0 +1,15 @@
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
+@@ -1331,7 +1331,11 @@
+                 timings.insert("focus_restore".into(), elapsed_ms(phase_start).into());
+             }
+             phase_start = std::time::Instant::now();
+-            let changes = super::finish_window_observation(snapshot, &args).await;
++            let changes = if observed_click {
++                super::finish_interactive_observation(snapshot).await
++            } else {
++                super::finish_window_observation(snapshot, &args).await
++            };
+             if observed_click {
+                 timings.insert("post_input_observation".into(), elapsed_ms(phase_start).into());
+             }

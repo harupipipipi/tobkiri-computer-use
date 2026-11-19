@@ -1,0 +1,233 @@
+--- a/libs/cua-driver/rust/crates/platform-macos/src/capture.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/capture.rs
+@@ -517,11 +517,12 @@
+     }))
+ }
+ 
+-/// Single-frame capture + RGBA/PNG encode from an existing plan.
+-///
+-/// https://developer.apple.com/documentation/screencapturekit/scscreenshotmanager
+-fn capture_window_from_plan(window_id: u32, plan: &WindowCapturePlan) -> anyhow::Result<Vec<u8>> {
+-    use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
++/// Capture one real image and validate its dimensions before reading pixels.
++fn capture_window_image(
++    window_id: u32,
++    plan: &WindowCapturePlan,
++) -> anyhow::Result<(screencapturekit::screenshot_manager::CGImage, u32, u32)> {
++    use screencapturekit::screenshot_manager::SCScreenshotManager;
+ 
+     let image = SCScreenshotManager::capture_image(&plan.filter, &plan.config).map_err(|e| {
+         anyhow::anyhow!("SCScreenshotManager::capture_image failed for window {window_id}: {e}")
+@@ -529,6 +530,13 @@
+ 
+     let w = checked_image_dim(image.width(), "CGImage width")?;
+     let h = checked_image_dim(image.height(), "CGImage height")?;
++    Ok((image, w, h))
++}
++
++fn capture_window_from_plan(window_id: u32, plan: &WindowCapturePlan) -> anyhow::Result<Vec<u8>> {
++    use screencapturekit::screenshot_manager::CGImageExt;
++
++    let (image, w, h) = capture_window_image(window_id, plan)?;
+ 
+     let rgba = image
+         .rgba_data()
+@@ -548,39 +556,50 @@
+     cua_driver_core::image_utils::encode_rgba_to_png(&rgba, w, h)
+ }
+ 
+-enum CaptureIdentityValidation {
+-    Matched(Vec<u8>),
++fn capture_dimensions_from_plan(
++    window_id: u32,
++    plan: &WindowCapturePlan,
++) -> anyhow::Result<(u32, u32)> {
++    let (_, w, h) = capture_window_image(window_id, plan)?;
++    Ok((w, h))
++}
++
++type PlanCapture<T> = fn(u32, &WindowCapturePlan) -> anyhow::Result<T>;
++
++enum CaptureIdentityValidation<T> {
++    Matched(T),
+     Changed(WindowCaptureIdentity),
+ }
+ 
+ /// Do not release bytes until WindowServer confirms that the window still has
+ /// the identity the plan was built for. The injected form keeps the TOCTOU
+ /// contract deterministic and independently testable.
+-fn capture_then_validate_identity<C, I>(
++fn capture_then_validate_identity<T, C, I>(
+     expected_identity: WindowCaptureIdentity,
+     capture: C,
+     current_identity: I,
+-) -> anyhow::Result<CaptureIdentityValidation>
++) -> anyhow::Result<CaptureIdentityValidation<T>>
+ where
+-    C: FnOnce() -> anyhow::Result<Vec<u8>>,
++    C: FnOnce() -> anyhow::Result<T>,
+     I: FnOnce() -> anyhow::Result<WindowCaptureIdentity>,
+ {
+-    let bytes = capture()?;
++    let captured = capture()?;
+     let actual_identity = current_identity()?;
+     if actual_identity == expected_identity {
+-        Ok(CaptureIdentityValidation::Matched(bytes))
++        Ok(CaptureIdentityValidation::Matched(captured))
+     } else {
+         Ok(CaptureIdentityValidation::Changed(actual_identity))
+     }
+ }
+ 
+-fn capture_window_from_plan_validated(
++fn capture_window_from_plan_validated<T>(
+     window_id: u32,
+     plan: &WindowCapturePlan,
+-) -> anyhow::Result<CaptureIdentityValidation> {
++    capture: PlanCapture<T>,
++) -> anyhow::Result<CaptureIdentityValidation<T>> {
+     capture_then_validate_identity(
+         plan.identity,
+-        || capture_window_from_plan(window_id, plan),
++        || capture(window_id, plan),
+         || current_window_capture_identity(window_id),
+     )
+ }
+@@ -593,11 +612,12 @@
+ /// A successful capture discovered that the window mutated. Rebuild once for
+ /// the observed identity; a second mutation fails closed so stale bytes can
+ /// never escape and the shell compatibility path can take over.
+-fn retry_after_identity_change(
++fn retry_after_identity_change<T>(
+     window_id: u32,
+     stale_plan: &std::sync::Arc<WindowCapturePlan>,
+     actual_identity: WindowCaptureIdentity,
+-) -> anyhow::Result<Vec<u8>> {
++    capture: PlanCapture<T>,
++) -> anyhow::Result<T> {
+     evict_window_capture_plan(window_id, stale_plan);
+     let rebuilt = build_window_capture_plan(window_id, actual_identity)?;
+     {
+@@ -605,8 +625,8 @@
+         cache.insert_at(window_id, std::sync::Arc::clone(&rebuilt), Instant::now());
+     }
+ 
+-    match capture_window_from_plan_validated(window_id, &rebuilt) {
+-        Ok(CaptureIdentityValidation::Matched(bytes)) => Ok(bytes),
++    match capture_window_from_plan_validated(window_id, &rebuilt, capture) {
++        Ok(CaptureIdentityValidation::Matched(captured)) => Ok(captured),
+         Ok(CaptureIdentityValidation::Changed(_)) => {
+             evict_window_capture_plan(window_id, &rebuilt);
+             anyhow::bail!(
+@@ -620,12 +640,12 @@
+     }
+ }
+ 
+-/// Native ScreenCaptureKit single-frame window capture (in-process PNG).
++/// Native ScreenCaptureKit single-frame window capture.
+ ///
+ /// Uses a desktop-independent window filter and `SCScreenshotManager` —
+ /// see module docs for Apple + crate source URLs. No subprocess/temp/base64.
+ /// Warm hits reuse a bounded two-second filter/config plan cache.
+-fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> {
++fn capture_window_sck_inner<T>(window_id: u32, capture: PlanCapture<T>) -> anyhow::Result<T> {
+     let identity = current_window_capture_identity(window_id)?;
+     let cached = {
+         let mut cache = lock_window_plan_cache();
+@@ -637,10 +657,10 @@
+             let mut cache = lock_window_plan_cache();
+             cache.remove_if(&window_id, |stored| std::sync::Arc::ptr_eq(stored, &plan));
+         } else {
+-            match capture_window_from_plan_validated(window_id, &plan) {
+-                Ok(CaptureIdentityValidation::Matched(bytes)) => return Ok(bytes),
++            match capture_window_from_plan_validated(window_id, &plan, capture) {
++                Ok(CaptureIdentityValidation::Matched(captured)) => return Ok(captured),
+                 Ok(CaptureIdentityValidation::Changed(actual_identity)) => {
+-                    return retry_after_identity_change(window_id, &plan, actual_identity);
++                    return retry_after_identity_change(window_id, &plan, actual_identity, capture);
+                 }
+                 Err(first_err) => {
+                     // Drop only this Arc if it is still the cached value.
+@@ -661,8 +681,8 @@
+                         cache.insert_at(window_id, std::sync::Arc::clone(&rebuilt), Instant::now());
+                     }
+ 
+-                    match capture_window_from_plan_validated(window_id, &rebuilt) {
+-                        Ok(CaptureIdentityValidation::Matched(bytes)) => return Ok(bytes),
++                    match capture_window_from_plan_validated(window_id, &rebuilt, capture) {
++                        Ok(CaptureIdentityValidation::Matched(captured)) => return Ok(captured),
+                         Ok(CaptureIdentityValidation::Changed(_)) => {
+                             evict_window_capture_plan(window_id, &rebuilt);
+                             return Err(anyhow::anyhow!(
+@@ -691,10 +711,10 @@
+         let mut cache = lock_window_plan_cache();
+         cache.insert_at(window_id, std::sync::Arc::clone(&plan), Instant::now());
+     }
+-    match capture_window_from_plan_validated(window_id, &plan) {
+-        Ok(CaptureIdentityValidation::Matched(bytes)) => Ok(bytes),
++    match capture_window_from_plan_validated(window_id, &plan, capture) {
++        Ok(CaptureIdentityValidation::Matched(captured)) => Ok(captured),
+         Ok(CaptureIdentityValidation::Changed(actual_identity)) => {
+-            retry_after_identity_change(window_id, &plan, actual_identity)
++            retry_after_identity_change(window_id, &plan, actual_identity, capture)
+         }
+         Err(error) => {
+             evict_window_capture_plan(window_id, &plan);
+@@ -706,11 +726,14 @@
+ /// Bound the dependency's synchronous callback wrappers without permitting an
+ /// unbounded number of detached workers. Ownership of the gate permit and all
+ /// ScreenCaptureKit/CF objects stays on the worker until it really returns.
+-fn screenshot_window_bytes_sck(window_id: u32) -> anyhow::Result<Vec<u8>> {
++fn capture_window_sck<T: Send + 'static>(
++    window_id: u32,
++    capture: PlanCapture<T>,
++) -> anyhow::Result<T> {
+     run_native_capture_worker(
+         native_capture_gate(),
+         WINDOW_CAPTURE_NATIVE_TIMEOUT,
+-        move || screenshot_window_bytes_sck_inner(window_id),
++        move || capture_window_sck_inner(window_id, capture),
+     )
+     .map_err(|error| {
+         anyhow::anyhow!(
+@@ -728,9 +751,18 @@
+ pub fn screenshot_window_bytes(window_id: u32) -> anyhow::Result<Vec<u8>> {
+     capture_window_with_backends(
+         window_id,
+-        screenshot_window_bytes_sck,
++        |id| capture_window_sck(id, capture_window_from_plan),
+         screenshot_window_bytes_shell,
+     )
++}
++
++/// Verify geometry against a fresh capture without copying or encoding its pixels.
++pub(crate) fn window_capture_dimensions(window_id: u32) -> anyhow::Result<(u32, u32)> {
++    capture_window_sck(window_id, capture_dimensions_from_plan).or_else(|native| {
++        screenshot_window_bytes_shell(window_id)
++            .and_then(|bytes| png_dimensions(&bytes))
++            .map_err(|shell| anyhow::anyhow!("window {window_id} capture failed: native: {native:#}; shell fallback: {shell:#}"))
++    })
+ }
+ 
+ /// Capture a window by its `window_id` (CGWindowID).
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/px_frame.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/px_frame.rs
+@@ -110,17 +110,12 @@
+         .ok_or(PxFrameError::WindowNotFound { window_id })?;
+     // A window-local point is meaningful only when the current capture proves
+     // the same frame and scale. Never guess 1× on capture failure.
+-    let png = crate::capture::screenshot_window_bytes(window_id).map_err(|e| {
++    let (pw, ph) = crate::capture::window_capture_dimensions(window_id).map_err(|e| {
+         PxFrameError::CaptureUnavailable {
+             window_id,
+             reason: e.to_string(),
+         }
+     })?;
+-    let (pw, ph) =
+-        crate::capture::png_dimensions(&png).map_err(|e| PxFrameError::CaptureUnavailable {
+-            window_id,
+-            reason: e.to_string(),
+-        })?;
+     let scale = validate_capture_frame(window_id, &bounds, pw, ph)?;
+     Ok(WindowPxFrame { bounds, scale })
+ }

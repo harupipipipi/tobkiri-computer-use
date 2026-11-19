@@ -29,6 +29,21 @@ def test_observe_act_stale_ref_and_post_image(rig):
     assert error["structuredContent"]["error"]["code"]=="stale_observation"
 
 
+def test_bound_label_and_ax_readback_skip_extra_capture(rig):
+    computer, transport = rig
+    service = ToolService(computer)
+    seen = call(service, "tobkiri_observe", pid=7, window_id=10)["structuredContent"]
+    transport.calls.clear()
+    args = dict(pid=7, window_id=10, observation_id=seen["observation_id"],
+                label="Increment", role="AXButton", action="click", readback="ax")
+    result = call(service, "tobkiri_act", **args)
+    assert not result.get("isError")
+    assert result["structuredContent"]["observation"]["image_size"] is None
+    assert [a["include_screenshot"] for name, a in transport.calls if name == "get_window_state"] == [False]
+    assert call(service, "tobkiri_act", **args)["isError"]
+    assert sum(name == "click" for name, _ in transport.calls) == 1
+
+
 def test_wrong_zoom_does_not_cross_windows(rig):
     c,t=rig; service=ToolService(c)
     a=call(service,"tobkiri_observe",pid=7,window_id=10)["structuredContent"]

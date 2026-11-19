@@ -534,6 +534,12 @@ export class Character {
     }
     if (e.phase === "start") {
       this.pending = null;
+      // Anchor updates can glide. An input event already has a dispatch
+      // point, so draw its pose there even if the body was still moving.
+      const dx = this.tx - this.x;
+      if (Math.abs(dx) > 2) this.facing = dx > 0 ? 1 : -1;
+      this.x = this.tx;
+      this.y = this.ty;
       this.active = true;
       this.play(e.action, 30);
     }

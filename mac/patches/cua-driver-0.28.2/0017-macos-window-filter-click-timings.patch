@@ -1,0 +1,364 @@
+--- a/libs/cua-driver/rust/crates/platform-macos/src/windows.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/windows.rs
+@@ -66,22 +66,23 @@
+ 
+ /// Enumerate all windows (including off-screen).
+ pub fn all_windows() -> Vec<WindowInfo> {
+-    all_windows_with_space_snapshot().windows
+-}
+-
+-pub(crate) fn all_windows_with_space_snapshot() -> WindowEnumeration {
+-    enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::ZeroOnly)
++    all_windows_with_space_snapshot(None).windows
++}
++
++pub(crate) fn all_windows_with_space_snapshot(pid: Option<i32>) -> WindowEnumeration {
++    enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::ZeroOnly, pid)
+ }
+ 
+ /// Enumerate only on-screen windows.
+ pub fn visible_windows() -> Vec<WindowInfo> {
+-    visible_windows_with_space_snapshot().windows
+-}
+-
+-pub(crate) fn visible_windows_with_space_snapshot() -> WindowEnumeration {
++    visible_windows_with_space_snapshot(None).windows
++}
++
++pub(crate) fn visible_windows_with_space_snapshot(pid: Option<i32>) -> WindowEnumeration {
+     enumerate_windows(
+         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+         LayerFilter::ZeroOnly,
++        pid,
+     )
+ }
+ 
+@@ -95,7 +96,7 @@
+ /// `get_window_state` tell "no such window" apart from "exists, but is not a
+ /// layer-0 window" (issue #2237).
+ fn all_windows_any_layer() -> Vec<WindowInfo> {
+-    enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer).windows
++    enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer, None).windows
+ }
+ 
+ /// Which CGWindow layers an enumeration admits.
+@@ -107,7 +108,7 @@
+     AnyLayer,
+ }
+ 
+-fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
++fn enumerate_windows(options: u32, layers: LayerFilter, pid_filter: Option<i32>) -> WindowEnumeration {
+     use core_foundation::{
+         array::CFArray,
+         base::{CFGetTypeID, CFTypeRef, TCFType},
+@@ -193,6 +194,11 @@
+ 
+         let window_id = get_num("kCGWindowNumber") as u32;
+         let pid = get_num("kCGWindowOwnerPID") as i32;
++        // Keep the original order and Space metadata, querying Spaces only
++        // for windows eligible to be returned by this call.
++        if pid_filter.is_some_and(|only| only != pid) {
++            continue;
++        }
+         let app_name = get_str("kCGWindowOwnerName");
+         let title = get_str("kCGWindowName");
+         let layer = get_num("kCGWindowLayer") as i32;
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/list_windows.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/list_windows.rs
+@@ -57,17 +57,12 @@
+         let on_screen_only = args.bool_or("on_screen_only", false);
+ 
+         let enumeration = if on_screen_only {
+-            crate::windows::visible_windows_with_space_snapshot()
++            crate::windows::visible_windows_with_space_snapshot(pid_filter)
+         } else {
+-            crate::windows::all_windows_with_space_snapshot()
++            crate::windows::all_windows_with_space_snapshot(pid_filter)
+         };
+         let current_space_id = enumeration.current_space_id;
+-        let mut windows = enumeration.windows;
+-
+-        if let Some(pid) = pid_filter {
+-            windows.retain(|w| w.pid == pid);
+-        }
+-
++        let windows = enumeration.windows;
+         let windows_json: Vec<Value> = windows.iter().map(window_record_json).collect();
+ 
+         ToolResult::text(format!("Found {} window(s).", windows_json.len())).with_structured(
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
+@@ -17,7 +17,7 @@
+     copy_element_attr, copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication,
+     AXUIElementRef, AxTopLevelReadError,
+ };
+-use crate::windows::{all_windows, resolve_window_owner, WindowOwner};
++use crate::windows::{all_windows_with_space_snapshot, resolve_window_owner, WindowOwner};
+ 
+ /// Bounded `AXParent` ascent used when an element does not expose `AXWindow`.
+ const MAX_ANCESTRY_DEPTH: usize = 40;
+@@ -311,7 +311,7 @@
+     let competing_keyboard_destinations = count_competing_keyboard_destinations(
+         pid,
+         window_id,
+-        all_windows()
++        all_windows_with_space_snapshot(Some(pid)).windows
+             .iter()
+             .map(|window| (window.pid, window.window_id)),
+         &records,
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/px_frame.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/px_frame.rs
+@@ -64,19 +64,33 @@
+     pub(crate) fn resolve(
+         &self, pid: i32, wid: u32, x: f64, y: f64,
+     ) -> Result<(f64, f64, f64, f64), ToolResult> {
+-        let Some(window) = crate::windows::window_info_by_id(wid) else {
++        let windows = crate::windows::visible_windows_with_space_snapshot(Some(pid)).windows;
++        let Some(window) = windows.iter().find(|window| window.window_id == wid) else {
+             return Err(refusal(&PxFrameError::WindowNotFound { window_id: wid }));
+         };
+         if window.pid != pid || window.layer != 0 || !window.is_on_screen
++            || window.on_current_space == Some(false)
+             || window.title != self.title || !same_bounds(&self.bounds, &window.bounds)
+         {
+             return Err(ToolResult::error("The observed window frame changed; refresh the screenshot.")
+                 .with_structured(serde_json::json!({"code": "stale_geometry", "effect": "refused"})));
+         }
+-        self.project(x, y).ok_or_else(|| {
++        let point = self.project(x, y).ok_or_else(|| {
+             ToolResult::error("The click is outside the observed screenshot.")
+                 .with_structured(serde_json::json!({"code": "invalid_point", "effect": "refused"}))
+-        })
++        })?;
++        if windows.iter().any(|sibling| {
++            let b = &sibling.bounds;
++            sibling.window_id != wid && sibling.is_on_screen
++                && sibling.on_current_space != Some(false)
++                && b.width > 0.0 && b.height > 0.0
++                && (b.x..=b.x + b.width).contains(&point.0)
++                && (b.y..=b.y + b.height).contains(&point.1)
++        }) {
++            return Err(ToolResult::error("A sibling window covers the observed click point.")
++                .with_structured(serde_json::json!({"code": "overlapping_window", "effect": "refused"})));
++        }
++        Ok(point)
+     }
+ 
+     fn project(&self, x: f64, y: f64) -> Option<(f64, f64, f64, f64)> {
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
+@@ -928,13 +928,10 @@
+             // win_local_x/y: window-local logical-pixel coords needed for
+             // CGEventSetWindowLocation in the Chromium recipe.
+             let observed_click = observed.is_some();
+-            let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(frame) = observed {
+-                let wid = window_id.expect("observed clicks require a window");
+-                match tokio::task::spawn_blocking(move || frame.resolve(pid, wid, cx, cy)).await {
+-                    Ok(Ok(point)) => point,
+-                    Ok(Err(refusal)) => return refusal,
+-                    Err(error) => return ToolResult::error(format!("Could not resolve observed frame: {error}")),
+-                }
++            let mut phase_start = std::time::Instant::now();
++            let mut timings = serde_json::Map::new();
++            let regular_point = if observed_click {
++                None
+             } else if let Some(wid) = window_id {
+                 match super::px_frame::resolve_or_refuse(wid).await {
+                     Ok(frame) => {
+@@ -958,13 +955,13 @@
+                                 frame.bounds.width, frame.bounds.height
+                             ));
+                         }
+-                        (sx, sy, lx, ly)
++                        Some((sx, sy, lx, ly))
+                     }
+                     Err(refusal) => return refusal,
+                 }
+             } else {
+                 // No window_id → treat x,y as screen coordinates (legacy behaviour).
+-                (cx, cy, cx, cy)
++                Some((cx, cy, cx, cy))
+             };
+ 
+             // ── Exact-target background gate (macOS background input v1) ──
+@@ -995,6 +992,22 @@
+                 None
+             };
+ 
++            let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(frame) = observed {
++                timings.insert("target_gate".into(), elapsed_ms(phase_start).into());
++                phase_start = std::time::Instant::now();
++                let wid = window_id.expect("observed clicks require a window");
++                let point = match tokio::task::spawn_blocking(move || frame.resolve(pid, wid, cx, cy)).await {
++                    Ok(Ok(point)) => point,
++                    Ok(Err(refusal)) => return refusal,
++                    Err(error) => return ToolResult::error(format!("Could not resolve observed frame: {error}")),
++                };
++                timings.insert("frame_and_overlap".into(), elapsed_ms(phase_start).into());
++                point
++            } else {
++                regular_point.expect("regular click resolved its point")
++            };
++            phase_start = std::time::Instant::now();
++
+             // A background PX action can still use an accessibility delivery
+             // backend after resolving the requested screen point. This keeps
+             // targeting (PX) orthogonal to delivery (AX) and avoids making a
+@@ -1009,7 +1022,7 @@
+                 let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
+                 let ax_result = tokio::task::spawn_blocking(move || unsafe {
+                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
+-                        return Ok::<bool, anyhow::Error>(false);
++                        return Ok::<(bool, Option<f64>), anyhow::Error>((false, None));
+                     };
+                     // The pid-scoped hit-test can resolve an element from a
+                     // same-process sibling overlapping the requested point.
+@@ -1018,8 +1031,9 @@
+                     // (already gated for this exact window).
+                     if crate::ax::exact_target::element_window_id(element) != Some(hit_test_wid) {
+                         CFRelease(element as _);
+-                        return Ok(false);
+-                    }
++                        return Ok((false, None));
++                    }
++                    let mut ax_press_ms = None;
+                     let delivered = if focus_only {
+                         crate::input::ax_actions::focus_element(element as usize).is_ok()
+                     } else {
+@@ -1027,7 +1041,9 @@
+                         let enabled = copy_bool_attr(element, "AXEnabled");
+                         if hit_test_ax_press_eligible(&advertised, enabled) {
+                             let press = core_foundation::string::CFString::new("AXPress");
++                            let started = std::time::Instant::now();
+                             let status = AXUIElementPerformAction(element, press.as_concrete_TypeRef());
++                            ax_press_ms = Some(elapsed_ms(started));
+                             if observed_click && status != kAXErrorSuccess {
+                                 CFRelease(element as _);
+                                 return Err(anyhow::anyhow!("AXPress returned {status}; effect is unknown"));
+@@ -1038,20 +1054,27 @@
+                         }
+                     };
+                     CFRelease(element as _);
+-                    Ok(delivered)
++                    Ok((delivered, ax_press_ms))
+                 })
+                 .await;
++                if observed_click {
++                    timings.insert("hit_test_and_ax".into(), elapsed_ms(phase_start).into());
++                }
+                 match ax_result {
+-                    Ok(Ok(true)) => {
++                    Ok(Ok((true, ax_press_ms))) => {
+                         let label = if focus_only { "focused" } else { "pressed" };
++                        let mut data = serde_json::json!({
++                            "path": "ax", "verified": false, "effect": "unverifiable"
++                        });
++                        if observed_click {
++                            if let Some(ms) = ax_press_ms {
++                                timings.insert("ax_press".into(), ms.into());
++                            }
++                            data["timings_ms"] = timings.into();
++                        }
+                         return ToolResult::text(format!(
+                             "✅ PX hit-test {label} the background element via AX."
+-                        ))
+-                        .with_structured(serde_json::json!({
+-                            "path": "ax",
+-                            "verified": false,
+-                            "effect": "unverifiable"
+-                        }));
++                        )).with_structured(data);
+                     }
+                     Ok(Err(error)) if observed_click => {
+                         return ToolResult::error(format!("{error}; no further input was sent."));
+@@ -1059,7 +1082,7 @@
+                     Err(error) if observed_click => {
+                         return ToolResult::error(format!("AX hit-test task failed: {error}; effect is unknown."));
+                     }
+-                    Ok(Ok(false)) if focus_only => {
++                    Ok(Ok((false, _))) if focus_only => {
+                         return ToolResult::error(
+                             "Background PX focus is unavailable at the requested point.".to_owned(),
+                         )
+@@ -1077,6 +1100,7 @@
+                 }
+             }
+ 
++            phase_start = std::time::Instant::now();
+             // Resolve the effective delivery posture before observation. A
+             // requested foreground click without a window id still degrades to
+             // background, matching the existing contract and result label.
+@@ -1167,6 +1191,10 @@
+             // button != left. Left-button path stays on the existing Chromium-
+             // routed `click_at_xy_with_window_local` for back-compat.
+             let button_kind = button_str.clone();
++            if observed_click {
++                timings.insert("focus_preparation".into(), elapsed_ms(phase_start).into());
++            }
++            phase_start = std::time::Instant::now();
+             let result = focus_guard::with_focus_suppressed(
+                 if activation_policy == PixelActivationPolicy::SuppressTarget {
+                     Some(pid)
+@@ -1253,6 +1281,10 @@
+             )
+             .await;
+ 
++            if observed_click {
++                timings.insert("event_delivery".into(), elapsed_ms(phase_start).into());
++            }
++            phase_start = std::time::Instant::now();
+             // The no-raise record can make NSWorkspace report the target as
+             // active even though its window never moved in z-order. Once the
+             // click has been queued, restore the prior app if the target is
+@@ -1276,7 +1308,14 @@
+                 }
+             }
+ 
++            if observed_click {
++                timings.insert("focus_restore".into(), elapsed_ms(phase_start).into());
++            }
++            phase_start = std::time::Instant::now();
+             let changes = super::finish_window_observation(snapshot, &args).await;
++            if observed_click {
++                timings.insert("post_input_observation".into(), elapsed_ms(phase_start).into());
++            }
+ 
+             let button_label = match button_str.as_str() {
+                 "right" => "right-click",
+@@ -1293,17 +1332,18 @@
+                     } else {
+                         ("cgevent", "background CGEvent")
+                     };
++                    let mut data = serde_json::json!({
++                        "path": path, "verified": false, "effect": "unverifiable",
++                        "focus_without_raise": focus_without_raise
++                    });
++                    if observed_click {
++                        data["timings_ms"] = timings.into();
++                    }
+                     ToolResult::text(format!(
+                         "✅ Posted {button_label} to pid {pid} ({mode_label}; \
+                          not driver-verified — confirm via screenshot).{}",
+                         changes.result_suffix()
+-                    ))
+-                    .with_structured(serde_json::json!({
+-                        "path": path,
+-                        "verified": false,
+-                        "effect": "unverifiable",
+-                        "focus_without_raise": focus_without_raise
+-                    }))
++                    )).with_structured(data)
+                 }
+                 Ok(Err(e)) => ToolResult::error(format!("{button_label} failed: {e}")),
+                 Err(e) => ToolResult::error(format!("Task error: {e}")),
+@@ -1314,6 +1354,10 @@
+             )
+         }
+     }
++}
++
++fn elapsed_ms(start: std::time::Instant) -> f64 {
++    start.elapsed().as_secs_f64() * 1000.0
+ }
+ 
+ // ── AX click implementation (blocking) ───────────────────────────────────────

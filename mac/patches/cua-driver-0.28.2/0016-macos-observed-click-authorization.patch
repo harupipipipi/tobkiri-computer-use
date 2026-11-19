@@ -1,0 +1,118 @@
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/authorization.rs
+@@ -267,6 +267,7 @@
+ 
+ const DESKTOP_INPUT_OPERATIONS: &[&str] = &[
+     "click",
++    "tobkiri_click_observed",
+     "double_click",
+     "right_click",
+     "drag",
+@@ -875,6 +876,7 @@
+ 
+         // Local reversible control and lifecycle operations.
+         "click"
++        | "tobkiri_click_observed"
+         | "double_click"
+         | "right_click"
+         | "drag"
+@@ -1129,7 +1131,10 @@
+             "authorization context expired".to_owned(),
+         ));
+     }
+-    crate::policy::authorize_tool_call(tool, args)?;
++    // The observed-screenshot route is a restricted window click. Honor
++    // every policy and manifest rule for click, including an explicit deny.
++    let policy_tool = if tool == "tobkiri_click_observed" { "click" } else { tool };
++    crate::policy::authorize_tool_call(policy_tool, args)?;
+     let risk = classify_tool_call(tool, args);
+     if risk.class == RiskClass::Unclassified {
+         return Err(crate::policy::AuthorizationError::Denied(format!(
+@@ -1146,9 +1151,9 @@
+         manifest
+             .validate_for_mode(mode)
+             .map_err(crate::policy::AuthorizationError::Denied)?;
+-        match manifest.decision(tool) {
++        match manifest.decision(policy_tool) {
+             crate::session_manifest::ManifestDecision::Allow => manifest
+-                .authorize_call(tool, args)
++                .authorize_call(policy_tool, args)
+                 .map_err(crate::policy::AuthorizationError::Denied)?,
+             crate::session_manifest::ManifestDecision::Deny
+             | crate::session_manifest::ManifestDecision::Ask => {
+@@ -1178,6 +1183,7 @@
+     let process_targeting_tool = matches!(
+         tool,
+         "click"
++            | "tobkiri_click_observed"
+             | "double_click"
+             | "right_click"
+             | "drag"
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/capture_scope.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/capture_scope.rs
+@@ -163,6 +163,7 @@
+     matches!(
+         tool_name,
+         "click"
++            | "tobkiri_click_observed"
+             | "double_click"
+             | "right_click"
+             | "scroll"
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/tool.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/tool.rs
+@@ -2554,6 +2554,7 @@
+     matches!(
+         tool,
+         "click"
++            | "tobkiri_click_observed"
+             | "double_click"
+             | "right_click"
+             | "scroll"
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
+@@ -236,18 +236,11 @@
+             description: "Background left click on pixels of the latest verified exact-window screenshot. For static layouts; observe again after window changes.".into(),
+             input_schema: serde_json::json!({
+                 "type": "object", "additionalProperties": false,
+-                "required": ["target", "snapshot_id", "x", "y"],
++                "required": ["pid", "window_id", "snapshot_id", "x", "y"],
+                 "properties": {
+                     "session": {"type": "string"},
+-                    "target": {
+-                        "type": "object", "additionalProperties": false,
+-                        "required": ["kind", "pid", "window_id"],
+-                        "properties": {
+-                            "kind": {"const": "window"},
+-                            "pid": {"type": "integer", "minimum": 1, "maximum": i32::MAX},
+-                            "window_id": {"type": "integer", "minimum": 1, "maximum": u32::MAX}
+-                        }
+-                    },
++                    "pid": {"type": "integer", "minimum": 1, "maximum": i32::MAX},
++                    "window_id": {"type": "integer", "minimum": 1, "maximum": u32::MAX},
+                     "snapshot_id": {"type": "string"},
+                     "x": {"type": "number", "minimum": 0},
+                     "y": {"type": "number", "minimum": 0}
+@@ -258,17 +251,18 @@
+     }
+ 
+     async fn invoke(&self, args: Value) -> ToolResult {
+-        let target = &args["target"];
+         let snapshot_id = args["snapshot_id"].as_str().and_then(cua_driver_core::element_token::parse_snapshot_handle);
+-        let pid = target["pid"].as_i64().and_then(|pid| i32::try_from(pid).ok()).filter(|pid| *pid > 0);
+-        let wid = target["window_id"].as_u64().and_then(|wid| u32::try_from(wid).ok()).filter(|wid| *wid > 0);
++        let pid = args["pid"].as_i64().and_then(|pid| i32::try_from(pid).ok()).filter(|pid| *pid > 0);
++        let wid = args["window_id"].as_u64().and_then(|wid| u32::try_from(wid).ok()).filter(|wid| *wid > 0);
+         let (Some(pid), Some(wid), Some(snapshot_id), Some(x), Some(y)) =
+             (pid, wid, snapshot_id, args["x"].as_f64(), args["y"].as_f64())
+         else {
+             return ToolResult::error("An exact window, screenshot snapshot_id and pixel x/y are required.");
+         };
+-        if target["kind"] != "window" {
+-            return ToolResult::error("Observed clicks require an exact window target.");
++        if !args["scope"].is_null() || !args["delivery_mode"].is_null()
++            || !args["target"].is_null()
++        {
++            return ToolResult::error("Observed clicks accept only the pid/window_id background route.");
+         }
+         let Some(frame) = self.0.state.element_cache.snapshot_metadata(
+             pid, u64::from(wid), snapshot_id, |payload| payload.pixel_frame.clone(),

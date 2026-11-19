@@ -1,12 +1,18 @@
-"""Opt-in acceptance on the two dedicated TobkiriFixture windows only."""
+"""Opt-in acceptance on dedicated TobkiriFixture windows only."""
+from collections import defaultdict
+from contextlib import closing, contextmanager
+from io import BytesIO
 from pathlib import Path
 import argparse
 import hashlib
 import json
 import re
 import statistics
+import subprocess
+import threading
 import time
 
+from PIL import Image
 from tobkiri_computer_use import ClickStep, Computer, ComputerError
 from tobkiri_computer_use.runtime import driver_command
 
@@ -15,17 +21,26 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--driver", help="Explicit native candidate executable; requires --socket")
 parser.add_argument("--socket", help="Already running candidate's socket; requires --driver")
 parser.add_argument("--output-dir", type=Path, default=ROOT / "artifacts")
-parser.add_argument("--measure-latency", action="store_true",
-                    help="Compare normal/fast virtual motion and clicks on the dedicated fixture")
-parser.add_argument("--fast-demo", action="store_true",
-                    help="Show only fast teleport moves and counter clicks on both fixture windows")
+mode = parser.add_mutually_exclusive_group()
+mode.add_argument("--measure-latency", action="store_true",
+                  help="Compare normal/fast virtual motion and clicks on the dedicated fixture")
+mode.add_argument("--fast-demo", action="store_true",
+                  help="Show only fast teleport moves and counter clicks on both fixture windows")
+mode.add_argument("--profile-timeline", action="store_true",
+                  help="Launch disposable control and canvas fixtures and profile 1ms-spaced clicks")
+mode.add_argument("--probe-file-sheet", action="store_true",
+                  help="Inspect a native Open sheet owned by a disposable TobkiriFixture")
+mode.add_argument("--measure-readback", action="store_true",
+                  help="Measure semantic edits with image or AX-only readback in a disposable fixture")
+mode.add_argument("--check-multiwindow", action="store_true",
+                  help="Check exact routing between two overlapping disposable TobkiriFixture windows")
+mode.add_argument("--check-electron-multiwindow", action="store_true",
+                  help="Run the same exact-window check on a disposable Electron pair")
 parser.add_argument("--wait-demo-start", action="store_true",
                     help="Pause the fast demo after saving initial observations; Enter starts it")
 args = parser.parse_args()
 if bool(args.driver) != bool(args.socket):
     parser.error("Supply --driver and --socket together; candidate tests never change trusted setup")
-if args.fast_demo and args.measure_latency:
-    parser.error("Choose --fast-demo or --measure-latency")
 if args.wait_demo_start and not args.fast_demo:
     parser.error("--wait-demo-start requires --fast-demo")
 OUT = args.output_dir.resolve()
@@ -37,6 +52,333 @@ command = driver_command(driver=args.driver, endpoint=args.socket) if args.socke
 
 def count(state):
     return int(re.search(r"Count: (\d+)", state.tree).group(1))
+
+
+@contextmanager
+def launched_fixture(computer, title, *arguments, executable=None):
+    binary = executable or ROOT / "artifacts/TobkiriFixture.app/Contents/MacOS/TobkiriFixture"
+    with subprocess.Popen([str(binary), *arguments], stdout=subprocess.DEVNULL) as fixture:
+        try:
+            deadline = time.monotonic() + 8
+            rows = []
+            while time.monotonic() < deadline and fixture.poll() is None:
+                rows = computer.windows(pid=fixture.pid)
+                for row in rows:
+                    if (row.get("title") == title and row.get("is_on_screen")
+                            and row.get("on_current_space") is not False):
+                        yield computer.window(pid=fixture.pid, window_id=row["window_id"])
+                        return
+                time.sleep(.1)
+            observed = [(row.get("title"), row.get("is_on_screen"), row.get("on_current_space")) for row in rows]
+            raise RuntimeError(f"Dedicated fixture did not show {title}: {observed}, exit={fixture.poll()}")
+        finally:
+            if fixture.poll() is None:
+                fixture.terminate()
+                try:
+                    fixture.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    fixture.kill()
+
+
+def profile_sequence(window, state, points, samples):
+    phases = defaultdict(list)
+    thread = threading.get_ident()
+    transport = window.computer.transport
+    original = transport.call
+
+    def call(name, arguments=None):
+        started = time.perf_counter_ns()
+        try:
+            return original(name, arguments)
+        finally:
+            if threading.get_ident() == thread:
+                phases[name].append((time.perf_counter_ns() - started) / 1e6)
+
+    steps = [ClickStep(index * .001, state.point(*points[index % len(points)]))
+             for index in range(samples)]
+    transport.call = call
+    try:
+        sequence = window.timeline(steps, on_late="stretch", max_lateness=0)
+    finally:
+        transport.call = original
+    events = sequence.events
+    gaps = [(right["started"] - left["started"]) * 1000
+            for left, right in zip(events, events[1:])]
+    native_phases = defaultdict(list)
+    for event in events:
+        for phase, milliseconds in event.get("delivery", {}).get("timings_ms", {}).items():
+            native_phases[phase].append(milliseconds)
+    return sequence, {
+        "status": sequence.status, "error": sequence.error,
+        "clicks": len(events), "requested_interval_ms": 1,
+        "dispatch_interval_median_ms": statistics.median(gaps) if gaps else None,
+        "dispatch_intervals_ms": gaps, "elapsed_seconds": sequence.elapsed,
+        "rpcs": {name: {"median_ms": statistics.median(times), "samples_ms": times}
+                 for name, times in phases.items()},
+        "native_phase_medians_ms": {phase: statistics.median(times)
+                                    for phase, times in native_phases.items()},
+        "routes": sorted({event["delivery"].get("route") or event["delivery"].get("path") or "unknown"
+                          for event in events if "delivery" in event}),
+    }
+
+
+def fixture_events(log, total):
+    deadline = time.monotonic() + 2
+    events = []
+    while time.monotonic() < deadline and len(events) < total:
+        if log.exists():
+            events = [json.loads(line) for line in log.read_text().splitlines(keepends=True) if line.endswith("\n")]
+        if len(events) < total:
+            time.sleep(.02)
+    return events
+
+
+def received_interval(events):
+    return statistics.median((right["time"] - left["time"]) * 1000
+                             for left, right in zip(events, events[1:]))
+
+
+def profile_timeline(command):
+    results = {}
+    button_log = OUT / "button-events.jsonl"
+    canvas_log = OUT / "canvas-events.jsonl"
+    if button_log.exists() or canvas_log.exists():
+        raise ValueError("Use a fresh output directory for the fixture event logs")
+
+    def save(name, case):
+        results[name] = case
+        (OUT / "timeline-profile.json").write_text(json.dumps(results, indent=2) + "\n")
+        print(json.dumps({name: {key: value for key, value in case.items() if key != "dispatch_intervals_ms"
+                                 and key != "rpcs"}}), flush=True)
+
+    with Computer(command=command, companion=False) as computer:
+        with launched_fixture(computer, "Tobkiri Fixture A", "--profile-timeline", "--single",
+                              "--event-log", str(button_log)) as window:
+            total = 0
+            for name, speed, keys, samples in (("button_fast_same", "fast", "A", 12),
+                                              ("button_fast_alternating", "fast", "AB", 12),
+                                              ("button_normal_alternating", "normal", "AB", 6)):
+                window.set_cursor_speed(speed)
+                state = window.observe()
+                points = [state.find(key, role="AXButton").point for key in keys]
+                _, case = profile_sequence(window, state, [(point.x, point.y) for point in points], samples)
+                events = fixture_events(button_log, total + samples)[total:]
+                case["received"] = "".join(event["button"] for event in events)
+                if len(events) > 1:
+                    case["fixture_interval_median_ms"] = received_interval(events)
+                save(name, case)
+                assert case["status"] == "completed" and case["received"] == keys * (samples // len(keys)), name
+                assert all(event["window_number"] == window.surface[1] for event in events)
+                total += samples
+        with launched_fixture(computer, "Tobkiri Drawing Fixture", "--profile-timeline", "--drawing",
+                              "--event-log", str(canvas_log)) as window:
+            state = window.observe()
+            with Image.open(BytesIO(state.image)) as image:
+                points = [(int(image.width * ratio), image.height // 2) for ratio in (.35, .65)]
+                # The drawing fixture's wide white panel is not an actionable AX
+                # element. Check the actual captured panel before using its pixels.
+                rgb = image.convert("RGB")
+                assert all(min(rgb.getpixel(point)) >= 245 for point in points)
+            _, case = profile_sequence(window, state, points, 12)
+            events = fixture_events(canvas_log, 24)
+            presses = [event for event in events if event["event"] == "down"]
+            case["received"] = len(presses)
+            if len(presses) > 1:
+                case["fixture_interval_median_ms"] = received_interval(presses)
+            save("canvas_fast_alternating", case)
+            assert case["status"] == "completed" and [event["event"] for event in events] == ["down", "up"] * 12
+            assert max(event["x"] for event in presses[::2]) < min(event["x"] for event in presses[1::2])
+            assert all(event["window_number"] == window.surface[1] for event in events)
+
+
+def probe_file_sheet(command):
+    directory = OUT / "fixture-files"
+    directory.mkdir(exist_ok=True)
+    (directory / "fixture-note.txt").write_text("Tobkiri file selection fixture\n")
+    with Computer(command=command, companion=False) as computer:
+        with launched_fixture(computer, "Tobkiri File Fixture",
+                              "--single", "--file-sheet-directory", str(directory)) as window:
+            state = window.observe(screenshot=False)
+            window.click(state.find("Choose Fixture File", role="AXButton"), readback="ax")
+            deadline = time.monotonic() + 7
+            while time.monotonic() < deadline:
+                rows = [row for row in computer.windows(pid=window.surface[0])
+                        if row["is_on_screen"] and row["window_id"] != window.surface[1]]
+                if rows:
+                    break
+                time.sleep(.1)
+            facts = {"parent": window.target, "panels": []}
+            for row in rows:
+                panel = computer.window(pid=row["pid"], window_id=row["window_id"], name="file-sheet")
+                try:
+                    observed = panel.observe(screenshot=False, max_elements=400)
+                    facts["panels"].append({
+                        "window_id": row["window_id"], "title": row["title"],
+                        "routes": observed.raw.get("background_input"),
+                        "roles": [element.role for element in observed.elements[:12]],
+                        "matched_file": bool(observed.find_all("fixture-note.txt")),
+                    })
+                finally:
+                    panel.close()
+            parent = window.observe(screenshot=False, max_elements=450)
+            facts["parent_sheets"] = [element.label for element in parent.elements if element.role == "AXSheet"]
+            canceled = parent.find_all("Cancel", role="AXButton")
+            if len(canceled) == 1:
+                try:
+                    dismissal = window.click(canceled[0], readback="ax")
+                    facts["parent_cancel"] = dismissal.delivery
+                    facts["dismissed"] = not dismissal.observation.find_all(role="AXSheet")
+                except ComputerError as error:
+                    facts["cancel_error"] = {"code": error.code, "message": str(error)}
+            (OUT / "file-sheet.json").write_text(json.dumps(facts, ensure_ascii=False, indent=2) + "\n")
+            print(json.dumps(facts, ensure_ascii=False), flush=True)
+            assert facts.get("dismissed"), "The file sheet must accept a semantic action through its exact parent"
+
+
+def measure_readback(command):
+    phases = {"same": defaultdict(list), "ax": defaultdict(list)}
+    with Computer(command=command, companion=False) as computer:
+        with launched_fixture(computer, "Tobkiri Fixture A", "--single") as window:
+            transport = computer.transport
+            call = transport.call
+            action_thread = threading.get_ident()
+            mode = None
+
+            def timed_call(name, arguments=None):
+                started = time.perf_counter_ns()
+                try:
+                    return call(name, arguments)
+                finally:
+                    if mode and threading.get_ident() == action_thread:
+                        phases[mode][name].append((time.perf_counter_ns() - started) / 1e6)
+
+            transport.call = timed_call
+            try:
+                for index in range(12):
+                    requested = "same" if index % 2 == 0 else "ax"
+                    state = window.observe()
+                    field = state.find("Name", role="AXTextField")
+                    value = f"Fixture value {index}"
+                    mode = requested
+                    started = time.perf_counter_ns()
+                    result = window.set_value(field, value, readback=mode)
+                    phases[mode]["total"].append((time.perf_counter_ns() - started) / 1e6)
+                    mode = None
+                    assert result.observation.find("Name", role="AXTextField").value == value
+                    assert (result.observation.image is not None) == (requested == "same")
+            finally:
+                transport.call = call
+    report = {mode: {name: {"median_ms": round(statistics.median(values), 2), "samples": len(values)}
+                     for name, values in timings.items()} for mode, timings in phases.items()}
+    (OUT / "readback.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report), flush=True)
+
+
+def canvas_point(state):
+    with Image.open(BytesIO(state.image)).convert("RGB") as image:
+        # The fixture's canvas is the only saturated pink region.
+        pixels = getattr(image, "get_flattened_data", image.getdata)()
+        indices = [i for i, (r, g, b) in enumerate(pixels)
+                   if r > g + 85 and b > g + 35]
+        assert indices, "Could not find the rendered canvas in the observed window"
+        x = [index % image.width for index in indices]
+        y = [index // image.width for index in indices]
+        return state.point((min(x) + max(x)) / 2, (min(y) + max(y)) / 2)
+
+
+def measure_covered_click(target, sibling, locate, read_count):
+    sibling_before = read_count(sibling.observe(screenshot=False))
+    state = target.observe()
+    before = read_count(state)
+    result = target.click(locate(state), readback="ax")
+    after = read_count(result.observation)
+    deadline = time.monotonic() + 1.2
+    while after == before and time.monotonic() < deadline:
+        time.sleep(.1)
+        after = read_count(target.observe(screenshot=False))
+    return {
+        "target": after - before, "sibling": read_count(sibling.observe(screenshot=False)) - sibling_before,
+        "route": result.delivery.get("route"), "effect": result.delivery.get("effect"),
+    }
+
+
+@contextmanager
+def overlapped_pair(computer, *, electron=False, profile="profile"):
+    executable = None
+    arguments = ("--overlapping-pair",)
+    if electron:
+        executable = ROOT.parent / "companion/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron"
+        arguments = (str(ROOT / "tests/fixtures/ElectronComputerFixture.cjs"), str(OUT / profile))
+    with launched_fixture(computer, "Tobkiri Overlap B", *arguments, executable=executable) as second:
+        pid = second.surface[0]
+        with closing(second), closing(computer.window(pid=pid, title="Tobkiri Overlap A")) as first:
+            ids = [second.surface[1], first.surface[1]]
+
+            def positions():
+                return [(row["window_id"], row["bounds"]) for row in computer.windows(pid=pid)
+                        if row["window_id"] in ids and row.get("is_on_screen")]
+            before = positions()
+            assert [window_id for window_id, _ in before] == ids
+            assert before[0][1] == before[1][1]
+            if electron:
+                for window in (first, second):
+                    window.observe(screenshot=False)
+                    window.wait_for(lambda view: bool(view.find_all("Increment", role="AXButton")), timeout=4)
+            yield first, second
+            assert positions() == before
+
+
+def check_multiwindow(command, *, electron=False):
+    def button_point(state):
+        button = state.find("Increment", role="AXButton")
+        return state.point(button.point.x + 4, button.point.y + 2)
+
+    def canvas_hits(state):
+        return int(re.search(r"Canvas hits: (\d+)", state.tree).group(1))
+
+    with Computer(command=command, companion=False) as computer:
+        report = {"driver": computer.transport.server_info["version"], "toolkit": "Electron" if electron else "AppKit",
+                  "overlapping": True}
+        try:
+            with overlapped_pair(computer, electron=electron) as (first, second):
+                primary = measure_covered_click(first, second, button_point, count)
+                report["covered_button"] = primary
+                assert (primary["target"], primary["sibling"]) == (1, 0)
+                if electron:
+                    assert primary["route"] == "accessibility"
+                    report["covered_canvas"] = measure_covered_click(first, second, canvas_point, canvas_hits)
+
+            # A fresh pair isolates the keyboard path from the pointer probes.
+            with overlapped_pair(computer, electron=electron, profile="keyboard-profile") as (first, second):
+                for window, key in ((first, "x"), (second, "y")):
+                    state = window.observe(screenshot=False)
+                    result = window.press_key(key, target=state.find("Name", role="AXTextField"), readback="ax")
+                    assert result.observation.find("Name", role="AXTextField").value == key
+                assert first.observe(screenshot=False).find("Name", role="AXTextField").value == "x"
+                report["separate_key_delivery"] = True
+                if electron:
+                    report["button_after_typing"] = measure_covered_click(first, second, button_point, count)
+                    for key in ("button_after_typing", "covered_canvas"):
+                        assert report[key]["target"] in (0, 1)
+                        assert report[key]["sibling"] == 0
+            report["window_order_preserved"] = True
+        finally:
+            (OUT / "multiwindow.json").write_text(json.dumps(report, indent=2) + "\n")
+            print(json.dumps(report), flush=True)
+
+
+if args.probe_file_sheet:
+    probe_file_sheet(command)
+    raise SystemExit(0)
+if args.measure_readback:
+    measure_readback(command)
+    raise SystemExit(0)
+if args.check_multiwindow or args.check_electron_multiwindow:
+    check_multiwindow(command, electron=args.check_electron_multiwindow)
+    raise SystemExit(0)
+if args.profile_timeline:
+    profile_timeline(command)
+    raise SystemExit(0)
 
 
 report = {"checks": {}, "timings_seconds": {}}

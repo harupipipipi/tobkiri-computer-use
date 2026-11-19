@@ -8,6 +8,7 @@ Cua Driverを基盤に、PythonとMCPからアプリを操作するComputer Use�
 - Pythonの要素検索、`Locator`、状態待機、座標グリッド、時刻指定の操作。
 - 画像のズーム、赤いクリック履歴、入力を送らず確認できるクリック前プレビュー。
 - 複数の名前付き仮想カーソル。物理マウスは1つの共有入力デバイスです。
+- Mac・Windows共通のカーソルテーマ。Cua標準、Windows風の矢印、棒人間、独自テーマを選べます。
 - Cua標準ツールの公開と、MCPクライアントを終了せず更新する仕組み。
 - [Cursor Studio](companion/README.md)：48種類のしぐさで操作についてくるキャラクター。
   棒人間の見た目、手描きカーソル、自作PNGアニメーションを編集できます。
@@ -33,11 +34,18 @@ python3 -m venv .venv
 通常のテストはデスクトップを操作しません。MCP設定、Pythonの使い方、実機試験は各 OS の
 README、エージェント用の手順は各パッケージの `skill/SKILL.md` にあります。
 
+カーソルの切り替え・素材導入・独自テーマ追加は
+[カーソルテーマ](mac/docs/CURSOR_THEMES.md)を参照してください。
+Pythonでは`window.set_cursor_theme("cua.default")`、MCPでは`tobkiri_cursor`の
+`action="theme"`を使います。矢印・棒人間はローカルCLIで一度導入してから選びます。
+
 ## 構成
 
 キャラクターの編集・デスクトップ表示は `companion/` で `npm ci` → `npm start`。
 Pythonは `Computer(companion=True)`、MCPは `TOBKIRI_COMPANION=1` で接続します。
-詳しくは [Cursor Studio の起動手順](companion/README.md) を参照してください。
+Tobkiri Tabs と同じカーソルを使うときも、見た目はこの Studio で編集します。
+保存した設定は Tabs の次の操作から反映されます。
+[Cursor Studio の起動と共有設定](companion/README.md)を参照してください。
 
 ```text
 mac/

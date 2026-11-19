@@ -38,9 +38,13 @@ function save() {
     const value = structuredClone(pack);
     saveChain = saveChain.then(async () => {
       try {
-        if (native) await native.save(value);
+        let saved;
+        if (native) saved = await native.save(value);
         else localStorage.setItem("tobkiri-character", JSON.stringify(value));
-        if (rev === revision) $("#save-state").textContent = "✓ 保存しました";
+        if (rev === revision)
+          $("#save-state").textContent = saved?.cursorPackError
+            ? "✓ 保存しました · Tabs への共有に失敗"
+            : "✓ 保存しました";
       } catch (error) {
         $("#save-state").textContent = "保存できませんでした";
         toast(
@@ -386,7 +390,9 @@ function updateDesktop(state) {
     `Python: Computer(companion=True) / MCP: TOBKIRI_COMPANION=1 · 非表示は Ctrl / ⌘ + Shift + F8`;
 }
 if (native) {
-  updateDesktop(desktopState);
+  if (desktopState) updateDesktop(desktopState);
+  if (desktopState?.cursorPackError)
+    $("#save-state").textContent = "Tabs へ設定を共有できませんでした";
   native.onConfig(updateDesktop);
   native.onEvent((event) => {
     if (event.source !== "pointer")

@@ -1,0 +1,123 @@
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/bindings.rs
+@@ -585,6 +585,11 @@
+     copy_children_with_error(element).elements
+ }
+ 
++/// AppKit's current sheets attached to this AX window. Caller releases each.
++pub unsafe fn copy_ax_sheets(window: AXUIElementRef) -> Vec<AXUIElementRef> {
++    copy_element_list_attr(window, "AXSheets").elements
++}
++
+ /// Copy an AX element-valued attribute. The returned element is retained and
+ /// must be released by the caller.
+ ///
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/exact_target.rs
+@@ -7,15 +7,16 @@
+ //! top-level keyboard destinations, and addressed-element ancestry. All reads are
+ //! bounded and fail closed — an unreadable fact never unlocks a route.
+ 
+-use core_foundation::base::{CFRelease, CFTypeRef};
++use core_foundation::base::{CFEqual, CFRelease, CFType, CFTypeRef, TCFType};
+ use cua_driver_core::background_input::{
+     BackgroundTargetFacts, ElementAncestry, WindowServerOwnership,
+ };
+ 
+ use super::bindings::{
+-    ax_get_window_id, copy_ax_windows_with_error, copy_bool_attr, copy_children_with_error,
+-    copy_element_attr, copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication,
+-    AXUIElementRef, AxTopLevelReadError,
++    ax_get_window_id, copy_ax_sheets, copy_ax_windows_with_error, copy_bool_attr, copy_children,
++    copy_children_with_error, copy_element_attr, copy_string_attr, focused_element_of_pid,
++    kAXErrorSuccess, AXUIElementCreateApplication, AXUIElementGetPid, AXUIElementRef,
++    AxTopLevelReadError,
+ };
+ use crate::windows::{all_windows_with_space_snapshot, resolve_window_owner, WindowOwner};
+ 
+@@ -68,6 +69,48 @@
+         CFRelease(current as CFTypeRef);
+     }
+     resolved
++}
++
++/// A file panel can be a separate WindowServer surface while remaining an AX
++/// sheet of the observed window. For semantic input only, prove attachment
++/// in both directions. Never infer an attachment from title or geometry.
++pub(crate) unsafe fn belongs_to_attached_sheet(
++    element: AXUIElementRef,
++    pid: i32,
++    window_id: u32,
++) -> bool {
++    let mut ancestor = CFType::wrap_under_get_rule(element as CFTypeRef);
++    for _ in 0..MAX_ANCESTRY_DEPTH {
++        let current = ancestor.as_CFTypeRef() as AXUIElementRef;
++        let role = copy_string_attr(current, "AXRole");
++        if matches!(role.as_deref(), None | Some("AXWindow" | "AXApplication")) {
++            return false;
++        }
++        let Some(parent) = copy_element_attr(current, "AXParent") else {
++            return false;
++        };
++        let parent_ref = CFType::wrap_under_create_rule(parent as CFTypeRef);
++        if role.as_deref() == Some("AXSheet") {
++            let mut owner = 0;
++            if AXUIElementGetPid(parent, &mut owner) != kAXErrorSuccess
++                || owner != pid
++                || copy_string_attr(parent, "AXRole").as_deref() != Some("AXWindow")
++                || ax_get_window_id(parent) != Some(window_id)
++            {
++                return false;
++            }
++            let contains_sheet = |children: Vec<AXUIElementRef>| {
++                // Consume all retains regardless of where the match occurs.
++                children.into_iter().fold(false, |matched, child| {
++                    let child = CFType::wrap_under_create_rule(child as CFTypeRef);
++                    matched || CFEqual(child.as_CFTypeRef(), ancestor.as_CFTypeRef()) != 0
++                })
++            };
++            return contains_sheet(copy_ax_sheets(parent)) || contains_sheet(copy_children(parent));
++        }
++        ancestor = parent_ref;
++    }
++    false
+ }
+ 
+ /// The process's focused AX element, but only when it provably belongs to the
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
+@@ -294,17 +294,31 @@
+     action: cua_driver_core::background_input::BackgroundAction,
+ ) -> Result<(), cua_driver_core::protocol::ToolResult> {
+     use cua_driver_core::background_input::{
+-        decide_background_input, BackgroundInputDecision, ExactWindowTarget,
++        decide_background_input, BackgroundAction, BackgroundInputDecision, ElementAncestry,
++        ExactWindowTarget, WindowServerOwnership,
+     };
+     let element_guard =
+         element_ptr.map(|ptr| unsafe { crate::ax::cache::RetainedElement::retain(ptr) });
+     let gathered = match tokio::task::spawn_blocking(move || {
+         let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
+-        crate::ax::exact_target::gather_background_facts_with_diagnostics(
++        let mut gathered = crate::ax::exact_target::gather_background_facts_with_diagnostics(
+             pid,
+             window_id,
+             element_ptr,
+-        )
++        );
++        if action == BackgroundAction::AxSemantic
++            && gathered.facts.window_server == WindowServerOwnership::SamePid
++            && gathered.facts.ax_window_present
++            && gathered.facts.element != ElementAncestry::ProvenDescendant
++            && element_ptr.is_some_and(|ptr| unsafe {
++                crate::ax::exact_target::belongs_to_attached_sheet(
++                    ptr as crate::ax::bindings::AXUIElementRef, pid, window_id,
++                )
++            })
++        {
++            gathered.facts.element = ElementAncestry::ProvenDescendant;
++        }
++        gathered
+     })
+     .await
+     {

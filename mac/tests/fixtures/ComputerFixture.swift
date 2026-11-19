@@ -1,5 +1,32 @@
 import Cocoa
 
+final class FileSheetControls: NSObject {
+    private let window: NSWindow
+    private let directory: URL
+    let status = NSTextField(labelWithString: "No fixture file selected")
+
+    init(window: NSWindow, directory: URL) {
+        self.window = window
+        self.directory = directory
+    }
+
+    @objc func chooseFixtureFile() {
+        guard window.attachedSheet == nil else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Tobkiri Fixture File Selection"
+        panel.directoryURL = directory
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, let selected = panel.url else { return }
+            let expected = self.directory.appendingPathComponent("fixture-note.txt")
+            self.status.stringValue = selected.standardizedFileURL == expected.standardizedFileURL
+                ? "Selected fixture-note.txt" : "Fixture selection differed"
+        }
+    }
+}
+
 struct FixtureLogDiagnostics {
     let pending: Int
     let dropped: Int
@@ -252,6 +279,19 @@ final class Controls: NSObject {
     @objc func apply() { saved.stringValue = "Saved: \(name.stringValue)" }
 }
 
+final class TimelineControls: NSObject {
+    let writer: AsyncJSONLWriter
+
+    init(writer: AsyncJSONLWriter) {
+        self.writer = writer
+    }
+
+    @objc func press(_ sender: NSButton) {
+        writer.append(["button": sender.title, "time": ProcessInfo.processInfo.systemUptime,
+                       "window_number": sender.window?.windowNumber ?? -1])
+    }
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 var fixtureLoggers: [AsyncJSONLWriter] = []
@@ -267,13 +307,58 @@ var controls: [Controls] = []
 var windows: [NSWindow] = []
 let single = CommandLine.arguments.contains("--single") || Bundle.main.object(forInfoDictionaryKey: "TobkiriSingleWindow") as? Bool == true
 let drawing = CommandLine.arguments.contains("--drawing") || Bundle.main.object(forInfoDictionaryKey: "TobkiriDrawingMode") as? Bool == true
+let timelineProfile = CommandLine.arguments.contains("--profile-timeline")
+let overlappingPair = CommandLine.arguments.contains("--overlapping-pair")
+var timelineControls: TimelineControls?
+var fileSheetControls: FileSheetControls?
+let fileDirectory: URL? = {
+    let arguments = CommandLine.arguments
+    guard let index = arguments.firstIndex(of: "--file-sheet-directory"),
+          index + 1 < arguments.count,
+          arguments[index + 1].hasPrefix("/") else { return nil }
+    return URL(fileURLWithPath: arguments[index + 1], isDirectory: true)
+}()
 let labels = drawing ? [] : (single ? ["A"] : ["A", "B"])
 for (i, label) in labels.enumerated() {
     let c = Controls()
-    let w = NSWindow(contentRect: NSRect(x: 80 + i * 510, y: 210, width: 480, height: 340),
+    let w = NSWindow(contentRect: NSRect(x: overlappingPair ? 80 : 80 + i * 510,
+                                         y: 210, width: 480, height: 340),
                      styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-    w.title = "Tobkiri Fixture \(label)"
+    w.title = overlappingPair ? "Tobkiri Overlap \(label)" : "Tobkiri Fixture \(label)"
     w.isReleasedWhenClosed = false
+    if overlappingPair {
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    }
+    if let directory = fileDirectory {
+        w.title = "Tobkiri File Fixture"
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let controls = FileSheetControls(window: w, directory: directory)
+        fileSheetControls = controls
+        let choose = NSButton(title: "Choose Fixture File", target: controls,
+                              action: #selector(FileSheetControls.chooseFixtureFile))
+        choose.frame = NSRect(x: 30, y: 180, width: 220, height: 36)
+        controls.status.frame = NSRect(x: 30, y: 125, width: 410, height: 28)
+        w.contentView!.addSubview(choose)
+        w.contentView!.addSubview(controls.status)
+        w.orderFrontRegardless()
+        windows.append(w)
+        continue
+    }
+    if timelineProfile {
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let writer = AsyncJSONLWriter(url: drawingEventLogURL())
+        let timeline = TimelineControls(writer: writer)
+        timelineControls = timeline
+        fixtureLoggers.append(writer)
+        for (index, label) in ["A", "B"].enumerated() {
+            let key = NSButton(title: label, target: timeline, action: #selector(TimelineControls.press(_:)))
+            key.frame = NSRect(x: 30 + index * 270, y: 135, width: 150, height: 64)
+            w.contentView!.addSubview(key)
+        }
+        w.orderFrontRegardless()
+        windows.append(w)
+        continue
+    }
     let heading = NSTextField(labelWithString: "Computer Use Test \(label)")
     heading.font = .boldSystemFont(ofSize: 22)
     heading.frame = NSRect(x: 30, y: 270, width: 410, height: 32)

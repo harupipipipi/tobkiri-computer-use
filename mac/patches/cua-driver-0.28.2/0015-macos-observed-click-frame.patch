@@ -1,0 +1,281 @@
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/element_cache.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/element_cache.rs
+@@ -126,6 +126,20 @@
+         })
+     }
+ 
++    /// Read metadata from the exact, still-current observation, without
++    /// retaining or exposing the AX elements in that observation.
++    pub fn snapshot_metadata<T>(
++        &self, pid: i32, window_id: u64, snapshot_id: u32, project: impl FnOnce(&S) -> Option<T>,
++    ) -> Option<T> {
++        if current_runtime_scope() != self.runtime_scope {
++            return None;
++        }
++        let inner = self.inner.lock().unwrap();
++        let snapshot = inner.get(&pid)?.iter()
++            .find(|entry| entry.window_id == window_id && entry.id == snapshot_id)?;
++        project(&snapshot.payload)
++    }
++
+     pub fn remove(&self, pid: i32, window_id: u64) {
+         let retired = {
+             let mut inner = self.inner.lock().unwrap();
+--- a/libs/cua-driver/rust/crates/platform-macos/src/ax/cache.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/ax/cache.rs
+@@ -34,6 +34,7 @@
+ 
+ pub struct CachedSnapshot {
+     pub elements: Vec<usize>,
++    pub(crate) pixel_frame: Option<crate::tools::px_frame::ObservedPixelFrame>,
+ }
+ 
+ impl CachedSnapshot {
+@@ -44,6 +45,7 @@
+                 .filter(|node| node.element_index.is_some())
+                 .map(|node| node.element_ptr)
+                 .collect(),
++            pixel_frame: None,
+         }
+     }
+ }
+@@ -100,6 +102,7 @@
+         unsafe { CFRetain(ptr as CFTypeRef) };
+         CachedSnapshot {
+             elements: vec![ptr],
++            pixel_frame: None,
+         }
+     }
+ 
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/get_window_state.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/get_window_state.rs
+@@ -523,7 +523,14 @@
+ 
+         let snapshot_id = prepared_snapshot
+             .filter(|_| scope_matched && !observation_only)
+-            .map(|payload| {
++            .map(|mut payload| {
++                if let (Some((bounds, _)), Some((width, height))) =
++                    (screenshot_frame.as_ref(), screenshot_dims)
++                {
++                    payload.pixel_frame = super::px_frame::ObservedPixelFrame::bind(
++                        pid, window_id, bounds, width, height,
++                    );
++                }
+                 self.state
+                     .element_cache
+                     .publish(pid, u64::from(window_id), payload)
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/px_frame.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/px_frame.rs
+@@ -31,6 +31,61 @@
+         let lx = cx / self.scale;
+         let ly = cy / self.scale;
+         (self.bounds.x + lx, self.bounds.y + ly, lx, ly)
++    }
++}
++
++/// The verified, delivered screenshot space of one observation. Convert to
++/// local logical points directly from that observation, even on scaled displays.
++#[derive(Clone)]
++pub(crate) struct ObservedPixelFrame {
++    bounds: WindowBounds,
++    width: u32,
++    height: u32,
++    title: String,
++}
++
++fn same_bounds(a: &WindowBounds, b: &WindowBounds) -> bool {
++    a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height
++}
++
++impl ObservedPixelFrame {
++    pub(crate) fn bind(
++        pid: i32, wid: u32, bounds: &WindowBounds, width: u32, height: u32,
++    ) -> Option<Self> {
++        let info = crate::windows::window_info_by_id(wid)?;
++        if info.pid != pid || info.layer != 0 || !info.is_on_screen
++            || !same_bounds(bounds, &info.bounds) || width == 0 || height == 0
++        {
++            return None;
++        }
++        Some(Self { bounds: bounds.clone(), width, height, title: info.title })
++    }
++
++    pub(crate) fn resolve(
++        &self, pid: i32, wid: u32, x: f64, y: f64,
++    ) -> Result<(f64, f64, f64, f64), ToolResult> {
++        let Some(window) = crate::windows::window_info_by_id(wid) else {
++            return Err(refusal(&PxFrameError::WindowNotFound { window_id: wid }));
++        };
++        if window.pid != pid || window.layer != 0 || !window.is_on_screen
++            || window.title != self.title || !same_bounds(&self.bounds, &window.bounds)
++        {
++            return Err(ToolResult::error("The observed window frame changed; refresh the screenshot.")
++                .with_structured(serde_json::json!({"code": "stale_geometry", "effect": "refused"})));
++        }
++        self.project(x, y).ok_or_else(|| {
++            ToolResult::error("The click is outside the observed screenshot.")
++                .with_structured(serde_json::json!({"code": "invalid_point", "effect": "refused"}))
++        })
++    }
++
++    fn project(&self, x: f64, y: f64) -> Option<(f64, f64, f64, f64)> {
++        if !(0.0..self.width as f64).contains(&x) || !(0.0..self.height as f64).contains(&y) {
++            return None;
++        }
++        let lx = x * self.bounds.width / self.width as f64;
++        let ly = y * self.bounds.height / self.height as f64;
++        Some((self.bounds.x + lx, self.bounds.y + ly, lx, ly))
+     }
+ }
+ 
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/click.rs
+@@ -218,6 +218,75 @@
+     }
+ 
+     async fn invoke(&self, args: Value) -> ToolResult {
++        self.invoke_click(args, None).await
++    }
++}
++
++/// Static-window replay entry point. Accepts only a current, exact native
++/// screenshot snapshot and background left-clicks. The ordinary click tool
++/// keeps its independently captured pixel-frame validation.
++pub struct ObservedClickTool(pub ClickTool);
++
++#[async_trait]
++impl Tool for ObservedClickTool {
++    fn def(&self) -> &ToolDef {
++        static OBSERVED: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
++        OBSERVED.get_or_init(|| ToolDef {
++            name: "tobkiri_click_observed".into(),
++            description: "Background left click on pixels of the latest verified exact-window screenshot. For static layouts; observe again after window changes.".into(),
++            input_schema: serde_json::json!({
++                "type": "object", "additionalProperties": false,
++                "required": ["target", "snapshot_id", "x", "y"],
++                "properties": {
++                    "session": {"type": "string"},
++                    "target": {
++                        "type": "object", "additionalProperties": false,
++                        "required": ["kind", "pid", "window_id"],
++                        "properties": {
++                            "kind": {"const": "window"},
++                            "pid": {"type": "integer", "minimum": 1, "maximum": i32::MAX},
++                            "window_id": {"type": "integer", "minimum": 1, "maximum": u32::MAX}
++                        }
++                    },
++                    "snapshot_id": {"type": "string"},
++                    "x": {"type": "number", "minimum": 0},
++                    "y": {"type": "number", "minimum": 0}
++                }
++            }),
++            read_only: false, destructive: true, idempotent: false, open_world: true,
++        })
++    }
++
++    async fn invoke(&self, args: Value) -> ToolResult {
++        let target = &args["target"];
++        let snapshot_id = args["snapshot_id"].as_str().and_then(cua_driver_core::element_token::parse_snapshot_handle);
++        let pid = target["pid"].as_i64().and_then(|pid| i32::try_from(pid).ok()).filter(|pid| *pid > 0);
++        let wid = target["window_id"].as_u64().and_then(|wid| u32::try_from(wid).ok()).filter(|wid| *wid > 0);
++        let (Some(pid), Some(wid), Some(snapshot_id), Some(x), Some(y)) =
++            (pid, wid, snapshot_id, args["x"].as_f64(), args["y"].as_f64())
++        else {
++            return ToolResult::error("An exact window, screenshot snapshot_id and pixel x/y are required.");
++        };
++        if target["kind"] != "window" {
++            return ToolResult::error("Observed clicks require an exact window target.");
++        }
++        let Some(frame) = self.0.state.element_cache.snapshot_metadata(
++            pid, u64::from(wid), snapshot_id, |payload| payload.pixel_frame.clone(),
++        ) else {
++            return ToolResult::error("The screenshot snapshot expired or has no verified pixel frame.")
++                .with_structured(serde_json::json!({"code": "stale_observation", "effect": "refused"}));
++        };
++        let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
++        self.0.invoke_click(serde_json::json!({
++            "pid": pid, "window_id": wid, "x": x, "y": y, "session": cursor_key,
++        }), Some(frame)).await
++    }
++}
++
++impl ClickTool {
++    async fn invoke_click(
++        &self, args: Value, observed: Option<super::px_frame::ObservedPixelFrame>,
++    ) -> ToolResult {
+         use cua_driver_core::tool_args::ArgsExt;
+ 
+         // ── Window-less screen-absolute branch (scope="desktop") ──────
+@@ -846,10 +915,12 @@
+                         ))
+                     }
+                 }
+-            } else if let Some(ratio) = self.state.resize_registry.ratio(pid, window_id) {
+-                // Coordinates are in the downscaled image space; scale back to native pixels.
+-                cx *= ratio;
+-                cy *= ratio;
++            } else if observed.is_none() {
++                if let Some(ratio) = self.state.resize_registry.ratio(pid, window_id) {
++                    // Coordinates are in the downscaled image space; scale back to native pixels.
++                    cx *= ratio;
++                    cy *= ratio;
++                }
+             }
+ 
+             // ── Window-local → screen coordinate translation ──────────────────
+@@ -862,7 +933,15 @@
+             //
+             // win_local_x/y: window-local logical-pixel coords needed for
+             // CGEventSetWindowLocation in the Chromium recipe.
+-            let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
++            let observed_click = observed.is_some();
++            let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(frame) = observed {
++                let wid = window_id.expect("observed clicks require a window");
++                match tokio::task::spawn_blocking(move || frame.resolve(pid, wid, cx, cy)).await {
++                    Ok(Ok(point)) => point,
++                    Ok(Err(refusal)) => return refusal,
++                    Err(error) => return ToolResult::error(format!("Could not resolve observed frame: {error}")),
++                }
++            } else if let Some(wid) = window_id {
+                 match super::px_frame::resolve_or_refuse(wid).await {
+                     Ok(frame) => {
+                         let (sx, sy, lx, ly) = frame.to_screen(cx, cy);
+@@ -954,8 +1033,12 @@
+                         let enabled = copy_bool_attr(element, "AXEnabled");
+                         if hit_test_ax_press_eligible(&advertised, enabled) {
+                             let press = core_foundation::string::CFString::new("AXPress");
+-                            AXUIElementPerformAction(element, press.as_concrete_TypeRef())
+-                                == kAXErrorSuccess
++                            let status = AXUIElementPerformAction(element, press.as_concrete_TypeRef());
++                            if observed_click && status != kAXErrorSuccess {
++                                CFRelease(element as _);
++                                return Err(anyhow::anyhow!("AXPress returned {status}; effect is unknown"));
++                            }
++                            status == kAXErrorSuccess
+                         } else {
+                             false
+                         }
+@@ -975,6 +1058,12 @@
+                             "verified": false,
+                             "effect": "unverifiable"
+                         }));
++                    }
++                    Ok(Err(error)) if observed_click => {
++                        return ToolResult::error(format!("{error}; no further input was sent."));
++                    }
++                    Err(error) if observed_click => {
++                        return ToolResult::error(format!("AX hit-test task failed: {error}; effect is unknown."));
+                     }
+                     Ok(Ok(false)) if focus_only => {
+                         return ToolResult::error(
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/mod.rs
+@@ -997,6 +997,7 @@
+         click::ClickTool::new(state.clone()),
+         &pid_window_candidates,
+     ));
++    registry.register(Box::new(click::ObservedClickTool(click::ClickTool::new(state.clone()))));
+     registry.register(pid_window_guarded(
+         double_click::DoubleClickTool::new(state.clone()),
+         &pid_window_candidates,
